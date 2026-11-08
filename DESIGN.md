@@ -36,19 +36,21 @@ app/
   api/
     deps.py                injectable dependencies (storage)         ✅
     webhooks.py            POST /webhooks/{payments,transactions}    ✅
-    payments.py            GET /payments, GET /payments/{id}         🟡
+    payments.py            GET /payments, GET /payments/{id}         ✅
   core/
     signature.py           canonical JSON + HMAC verification        ✅
   domain/
     models.py              inbound event schemas (Decimal amounts)   ✅
+    schemas.py             query API response schemas                ✅
     status.py              pure: amounts + tolerance -> status        ✅
   services/
     ingest.py              idempotent persistence of events          ✅
+    queries.py             read-side views for the query API         ✅
   reconciliation/
     normalize.py           reference / payer-name normalization      ✅
     matcher.py             pure: transaction + candidates -> links   ✅
     engine.py              orchestration, re-scan, writes links      ✅
-tests/                                                               ✅ (signature, webhooks, normalize, status, matcher, engine)
+tests/                                                               ✅ (signature, webhooks, storage, normalize, status, matcher, engine, query API)
 ```
 
 ### Webhook request flow ✅
@@ -143,9 +145,11 @@ derived from this, not from guesses.
 
 ### What this implies
 
-- **Reference is the primary signal but needs extraction.** Every real reference has the
-  shape `(REF|ORD|PAY|INV)-YYYY-NNNN`; extracting that pattern fixes both noisy cases. No
-  typo'd references were observed, so edit-distance matching is **not** needed yet.
+- **Reference is the primary signal but sometimes needs extraction.** Every observed
+  reference had the shape `(REF|ORD|PAY|INV)-YYYY-NNNN`, and finding the reference inside
+  noisy text fixes both noisy cases. The matcher does **not** depend on that shape
+  (§5) — it's one sample, and other providers or test data will differ. No typo'd
+  references were observed, so edit-distance matching is not needed yet.
 - **Payer name alone must never decide a match.** Most payers have several open payments.
   The `UNKNOWN-*` transactions match no outstanding balance; forcing a name match would
   misallocate money.
@@ -181,14 +185,45 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
 
 | Tier | Rule | `match_type` |
 |---|---|---|
-| 1 | Uppercase/trim, regex-extract `(REF\|ORD\|PAY\|INV)-\d{4}-\d{4}`; one extracted ref matching a payment → link full amount | `EXACT_REF` / `EXTRACTED_REF` (if cleanup was needed) |
-| 1b | Several extracted refs → allocate across them, filling each remaining balance in order; remainder to the last | `MULTI_REF` (not yet observed) |
-| 2 | No usable ref (empty or `UNKNOWN-*`): same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
+| 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for known payment references as whole tokens (min length 4), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
+| 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last | `MULTI_REF` (not yet observed) |
+| 2 | No usable ref — empty or placeholder (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its grace period has passed: same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
+| 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
 | 3 | Nothing confident → leave unmatched, surfaced in the unmatched list | — |
 
+- **References are format-agnostic.** An earlier version only recognised the observed
+  `REF/ORD/PAY/INV-YYYY-NNNN` shape and treated anything else as "no reference" — so
+  `INV-2024-001` (the format in the provided `storage.py`) or `ABC123` silently failed to
+  match even when identical to a payment's reference. Fixed by trying exact equality first
+  and using the pattern only as an extra signal when searching noisy text (caught in
+  review; regression tests in `tests/test_matcher.py`).
+- **A reference that matches no payment waits, then falls back.** References aren't always
+  informative (free text such as "November invoice"), so such a transaction may still be
+  matched on payer + amount — but only after a **grace period** (`REFERENCE_GRACE_MINUTES`,
+  default 15) measured from when *we received it*, giving the referenced payment time to
+  arrive. Empty and placeholder references fall back immediately. Fallback links keep
+  their tier's match type and note `reference '…' matched no payment`.
+  - *Why wait:* falling back immediately put money on the wrong invoice whenever a
+    transaction arrived before its payment. The simulation suite showed it on 5 shuffled
+    datasets — e.g. `txn_sim5_0015` (ref `PAY-2026-8701`, position 14) linked to another
+    Prime Logistics payment within tolerance, while its real payment arrived at position 79.
+  - *Why receipt time:* the provider's `settled_at` can be old or skewed and would skip the wait.
+  - *Periodic runs:* matching normally runs on new events; a timer
+    (`RECONCILE_INTERVAL_SECONDS`, default 60) re-runs it so waiting transactions get their
+    fallback even when the stream is quiet.
+  - *Residual risk:* a payment arriving *after* the grace period still loses its
+    transaction to an earlier fallback (Q9).
 - In tier 1 the reference wins even if the payer name differs; name similarity is
   recorded on the link as a confidence signal, not used as a gate.
-- Fuzzy (edit-distance) reference matching is deferred until the data shows typos.
+- **Fuzzy payer names (tier 2b).** A weaker name signal demands a stronger amount signal,
+  so there is no fee tolerance in this tier. The 0.85 threshold is data-driven: across all
+  real payers, the most similar *different* companies score 0.56 (`Pacific Ventures` vs
+  `Pinnacle Enterprises`), while misspellings and plural variants score 0.85–0.97
+  (`Stelar Group` 0.96, `Prime Logistic` 0.97, `Metro Supply` 0.85). Names differing only
+  by a number (`Payer 1` vs `Payer 2`, 0.86) are excluded by the numbers guard. Tier 2b
+  never runs when an exact-name payer exists, so it can't redirect money to a
+  different but similar payer.
+- Fuzzy (edit-distance) *reference* matching is deferred until the data shows typos.
 - Links are immutable once made, so results are reproducible and explainable.
 
 ### Status
@@ -271,6 +306,28 @@ All 27 transactions in §4: 24 linked (21 `EXACT_REF`, 1 `EXTRACTED_REF`, 2 `NAM
 3 `UNKNOWN-*` left unmatched with a reason. Payments: 18 `FULLY_PAID` (incl. REF-2026-1047
 at −1.5%), 2 `PARTIALLY_PAID` (REF-2026-8710, REF-2026-9857, outside the 2% tolerance).
 
+### Query API ✅
+
+| Endpoint | Returns |
+|---|---|
+| `GET /payments` | `summary`, `pagination`, `payments` (each with linked transactions), `unmatched_transactions` (each with the matcher's reason) |
+| `GET /payments/{payment_id}` | One payment with linked transactions; 404 if unknown |
+
+- **Filters:** `status` (enum, 422 if invalid), `search` (case-insensitive substring of
+  payment ID, reference, payer name, email; also filters unmatched transactions),
+  `page` / `page_size` (default 20, max 100). Newest first, `payment_id` as tie-breaker
+  so pages are stable.
+- **Summary is over all data**, independent of filters, so the dashboard numbers don't
+  change as you page or filter.
+- **Totals are grouped by currency** — amounts are never summed across currencies.
+- **Amounts are JSON strings** with two decimals, matching the provider, so no precision
+  is lost.
+- **`outstanding_amount` is 0 once `FULLY_PAID`/`OVERPAID`**: a shortfall within the fee
+  tolerance is treated as fees, so a settled payment never shows money still due.
+- Linked transactions show both `allocated_amount` and `transaction_amount`, which differ
+  for multi-payment splits.
+- Reads use the cached status projection; nothing is recomputed per request.
+
 ---
 
 ## 6. Assumptions
@@ -305,6 +362,8 @@ Questions we would ask the assignment authors; current handling noted for each.
 | Q6 | Should a refund with no identifiable original payment be surfaced separately from other unmatched transactions? | Plan: shown in unmatched list with its negative amount |
 | Q7 | Can a single transaction partly match one payment and leave a remainder unallocated? | No — every matched transaction is fully allocated; a multi-reference remainder goes to the last referenced payment (may make it `OVERPAID`) |
 | Q8 | Are the `PENDING / PARTIALLY_PAID / FULLY_PAID / OVERPAID` statuses exhaustive, or is something like `REFUNDED` expected? | Using only the four specified |
+| Q9 | When a fallback (payer + amount) link turns out wrong because the referenced payment arrives *after* the grace period, should the link be **moved** to it automatically? | Open. Not implemented: links are immutable. Option: mark fallback links provisional and, when a payment arrives whose reference exactly equals the transaction's, move the link atomically and recalculate both payments (the first payment's status may regress). |
+| Q10 | What grace period suits the provider? | 15 minutes by default, configurable. Observed payments arrived before their transactions, so the wait rarely matters live; shuffled simulations show it's what prevents wrong matches. |
 
 ---
 
@@ -325,5 +384,5 @@ Questions we would ask the assignment authors; current handling noted for each.
     as an explicit backfill when the fee tolerance changes.
 - Manual review endpoint to confirm/reject low-confidence matches.
 - LLM-assisted *suggestions* (never auto-links) for transactions the rules leave unmatched.
-- Pagination, search and rate limiting on the query API (bonus tasks).
+- Rate limiting on the query API (bonus task); cursor-based pagination for large datasets.
 - Docker / docker-compose.
