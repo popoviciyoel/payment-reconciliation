@@ -39,7 +39,7 @@ from itertools import combinations
 from decimal import Decimal
 from enum import Enum
 
-from app.domain.status import Tolerance
+from app.domain.status import PaymentStatus, Tolerance, compute_status
 from app.reconciliation.normalize import (
     find_references,
     is_placeholder_reference,
@@ -264,7 +264,7 @@ def _match_by_name_and_amount(
         if len(fits) > 1:
             return _unmatched(f"no usable reference; ambiguous between {', '.join(p.payment_id for p in fits)}")
         if txn.amount > 0:
-            combined = _match_combined_balances(txn, same_payer)
+            combined = _match_combined_balances(txn, same_payer, tolerance)
             if combined is not None:
                 return combined
         # Exact-name candidates exist but none fit: a fuzzy pass can't do better
@@ -277,14 +277,31 @@ def _match_by_name_and_amount(
     return _match_by_similar_name(txn, same_currency, name_threshold)
 
 
-def _match_combined_balances(txn: TransactionView, same_payer: list[PaymentView]) -> MatchResult | None:
+_OPEN_STATUSES = frozenset({PaymentStatus.PENDING, PaymentStatus.PARTIALLY_PAID})
+
+
+def _match_combined_balances(
+    txn: TransactionView, same_payer: list[PaymentView], tolerance: Tolerance
+) -> MatchResult | None:
     """
     Tier 2c: one reference-less transaction paying several invoices. Requires an
     exact sum of remaining balances and a unique combination. Returns None when
     there is no combination (caller reports unmatched), an unmatched result when
     it's ambiguous or too large to search.
+
+    Candidates are payments still open *by status*: a FULLY_PAID payment's
+    shortfall within the fee tolerance is fees, not a balance to fill. Each part
+    of a sum of positive balances is smaller than the total, so larger balances
+    are pruned before the search.
     """
-    open_payments = sorted((p for p in same_payer if p.remaining > 0), key=lambda p: p.payment_id)
+    open_payments = sorted(
+        (
+            p for p in same_payer
+            if compute_status(p.expected, p.received, tolerance) in _OPEN_STATUSES
+            and 0 < p.remaining < txn.amount
+        ),
+        key=lambda p: p.payment_id,
+    )
     if len(open_payments) < 2:
         return None
     if len(open_payments) > MAX_OPEN_PAYMENTS_FOR_COMBINATIONS:
@@ -293,16 +310,19 @@ def _match_combined_balances(txn: TransactionView, same_payer: list[PaymentView]
             f"is too many to search for a combined amount"
         )
 
-    combos = [
-        combo
-        for size in range(2, MAX_PAYMENTS_PER_TRANSACTION + 1)
-        for combo in combinations(open_payments, size)
-        if sum((p.remaining for p in combo), Decimal("0")) == txn.amount
-    ]
+    combos = []
+    for size in range(2, MAX_PAYMENTS_PER_TRANSACTION + 1):
+        for combo in combinations(open_payments, size):
+            if sum((p.remaining for p in combo), Decimal("0")) == txn.amount:
+                combos.append(combo)
+                if len(combos) > 1:
+                    break  # a second combination already makes it ambiguous
+        if len(combos) > 1:
+            break
     if not combos:
         return None
     if len(combos) > 1:
-        options = " | ".join(", ".join(p.payment_id for p in c) for c in combos[:3])
+        options = " | ".join(", ".join(p.payment_id for p in c) for c in combos)
         return _unmatched(f"no usable reference; amount equals several combinations of open payments: {options}")
 
     combo = combos[0]

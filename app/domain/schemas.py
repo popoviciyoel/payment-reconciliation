@@ -19,7 +19,7 @@ class LinkedTransaction(BaseModel):
     transaction_amount: Decimal = Field(description="Full transaction amount (differs from allocated for multi-payment splits)")
     match_type: str = Field(
         description="Why it matched: EXACT_REF, EXTRACTED_REF, MULTI_REF, NAME_AMOUNT, "
-                    "REFUND_NAME_AMOUNT, FUZZY_NAME_AMOUNT"
+                    "REFUND_NAME_AMOUNT, FUZZY_NAME_AMOUNT, MULTI_NAME_AMOUNT"
     )
     match_notes: str | None = None
     reference: str | None = None

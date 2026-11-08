@@ -188,7 +188,7 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
 | 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for known payment references as whole tokens (min length 4), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
 | 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last. If a well-formed reference in the text has no payment yet, wait out the grace period first, then allocate across the payments that exist | `MULTI_REF` (not yet observed) |
 | 2 | No usable ref — empty or placeholder (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its grace period has passed: same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
-| 2c | Exact payer, no single payment fits, positive amount: amount **exactly** equals the combined remaining balances of 2–3 of that payer's open payments, and **exactly one** such combination (searched only when the payer has ≤ 30 open payments) | `MULTI_NAME_AMOUNT` |
+| 2c | Exact payer, no single payment fits, positive amount: amount **exactly** equals the combined remaining balances of 2–3 of that payer's open payments (`PENDING`/`PARTIALLY_PAID` by status, so a fee shortfall on a `FULLY_PAID` payment is never treated as a balance), and **exactly one** such combination. Balances not smaller than the amount are pruned first; searched only when ≤ 30 candidates remain, and stops at the second combination found | `MULTI_NAME_AMOUNT` |
 | 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
 | 3 | Nothing confident → leave unmatched, surfaced in the unmatched list | — |
 
@@ -221,6 +221,8 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
   equals the combined open balances of 2–3 payments from the same payer (2c). Tier 2c is the
   riskiest tier, so it demands an exact sum, a unique combination and an exact payer, and
   never uses fuzzy names; a single payment that fits always wins over a combination.
+  Known gap: a reference-less refund of a 2c split can't be matched, because each payment
+  only records its own share, not the transaction total; it stays unmatched for review.
 - **Fuzzy payer names (tier 2b).** A weaker name signal demands a stronger amount signal,
   so there is no fee tolerance in this tier. The 0.85 threshold is data-driven: across all
   real payers, the most similar *different* companies score 0.56 (`Pacific Ventures` vs

@@ -73,7 +73,7 @@ ngrok's free tier issues a new URL on every restart; re-subscribe when it change
 pytest
 ```
 
-409 tests (10 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
+411 tests (10 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
 the matcher (with real provider cases as fixtures), the engine (including crash safety), the
 query API, and end-to-end replays of simulated data (`tests/test_simulated_data.py`):
 
@@ -275,7 +275,12 @@ non-reproducible results on financial data.
 
 **Known limitations today:** single process only (locks are in-process); a tolerance
 change applies on restart and doesn't redo existing links; refunds and transactions covering several
-payments are tested but haven't yet appeared in provider data.
+payments are tested but haven't yet appeared in provider data; a reference-less refund of a
+transaction that tier 2c split across several payments can't be matched (each payment only
+records its own share), so it stays in the unmatched list for review; a noisy reference
+that also names an invoice number with no payment holds the whole transaction for the grace
+period, even though the other referenced payment exists (the price of not over-allocating
+when a referenced payment is merely late).
 
 ---
 
@@ -315,7 +320,7 @@ including how to weigh each trade-off, were mine.
   out-of-order delivery).
 
 **How I validated the AI's output**
-- **Tests:** 409 automated tests, many using real provider events as fixtures, plus
+- **Tests:** 411 automated tests, many using real provider events as fixtures, plus
   replays of seeded simulated data with known correct answers. The matcher must never
   link money to the wrong payment.
 - **Against live data:** checked every stored event and match outcome (24 of 27

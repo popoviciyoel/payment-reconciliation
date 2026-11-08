@@ -410,9 +410,24 @@ def test_combinations_never_cross_payers_or_use_fuzzy_names():
 
 def test_too_many_open_payments_skips_combination_search():
     payments = [pay(f"p{i}", f"R-{i}", f"{i + 1}.00", "Acme") for i in range(MAX_OPEN_PAYMENTS_FOR_COMBINATIONS + 1)]
-    r = match(txn(None, "0.50", "Acme"), payments, TOL)
+    r = match(txn(None, "1000.00", "Acme"), payments, TOL)   # every balance is below the amount
     assert not r.matched and "too many" in r.reason
 
 
 def test_refund_never_uses_combinations():
     assert not match(txn(None, "-350.00", "Acme"), COMBO, TOL).matched
+
+
+def test_combination_ignores_payment_settled_within_fee_tolerance():
+    # A received 98 of 100: FULLY_PAID within 2%, so its 2.00 shortfall is fees, not a balance.
+    payments = [pay("a", "R-1", "100.00", "Acme", received="98.00", linked=["98.00"]),
+                pay("b", "R-2", "50.00", "Acme")]
+    assert not match(txn(None, "52.00", "Acme"), payments, TOL).matched
+
+
+def test_balances_larger_than_the_amount_are_pruned_before_searching():
+    # 31 open payments, but only two are smaller than the amount: no "too many" refusal.
+    payments = [pay(f"big{i}", f"R-{i}", "500.00", "Acme") for i in range(MAX_OPEN_PAYMENTS_FOR_COMBINATIONS)]
+    payments += [pay("s1", "S-1", "40.00", "Acme"), pay("s2", "S-2", "60.00", "Acme")]
+    r = match(txn(None, "100.00", "Acme"), payments, TOL)
+    assert {a.payment_id for a in r.allocations} == {"s1", "s2"}

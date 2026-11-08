@@ -178,5 +178,11 @@ def get_payment(storage: JsonStorage, payment_id: str) -> Payment | None:
     record = storage.get_payment(payment_id)
     if record is None:
         return None
-    txns_by_id = {t["transaction_id"]: t for t in storage.get_all_transactions()}
-    return _to_payment(record, storage.get_links_for_payment(payment_id), txns_by_id)
+    links = storage.get_links_for_payment(payment_id)
+    # Only the transactions this payment links to, not the whole table.
+    txns_by_id = {
+        tid: txn
+        for tid in {l["transaction_id"] for l in links}
+        if (txn := storage.get_transaction(tid)) is not None
+    }
+    return _to_payment(record, links, txns_by_id)
