@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request, status
@@ -77,15 +78,42 @@ async def verified_payload(request: Request) -> dict[str, Any]:
         logger.error("WEBHOOK_SECRET is not configured; rejecting webhook")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Webhook secret not configured")
 
+    raw_body = await request.body()
     try:
-        payload = json.loads(await request.body())
+        payload = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be valid JSON")
     if not isinstance(payload, dict):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be a JSON object")
 
-    if not verify_signature(payload, request.headers.get(SIGNATURE_HEADER), secret):
+    header = request.headers.get(SIGNATURE_HEADER)
+    if not verify_signature(payload, header, secret):
         logger.warning("Rejected webhook with invalid signature on %s", request.url.path)
+        if settings.debug:
+            _log_rejected(request.url.path, raw_body, header, payload, secret)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature")
 
     return payload
+
+
+REJECTED_EVENT_LOG = Path("data/rejected_events.jsonl")
+
+
+def _log_rejected(path: str, raw_body: bytes, header: str | None, payload: dict, secret: str) -> None:
+    """
+    DEBUG only: record rejected requests so signature mismatches can be
+    diagnosed (provider sending bad signatures vs our canonical form being
+    wrong). Disabled in production: it persists unauthenticated input.
+    """
+    try:
+        REJECTED_EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with REJECTED_EVENT_LOG.open("a") as f:
+            f.write(json.dumps({
+                "path": path,
+                "received_signature": header,
+                "computed_ascii": compute_signature(payload, secret, ensure_ascii=True),
+                "computed_utf8": compute_signature(payload, secret, ensure_ascii=False),
+                "raw_body": raw_body.decode("utf-8", errors="replace"),
+            }) + "\n")
+    except OSError:
+        logger.exception("Failed to write rejected event log")

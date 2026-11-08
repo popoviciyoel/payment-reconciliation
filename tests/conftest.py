@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import get_storage
 from app.config import settings
+from app.core import signature
 from app.core.signature import compute_signature
 from app.main import app
 from app.services import ingest
@@ -15,6 +16,7 @@ TEST_SECRET = "whsec_test_secret"
 def store(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "webhook_secret", TEST_SECRET)
     monkeypatch.setattr(ingest, "RAW_EVENT_LOG", tmp_path / "raw_events.jsonl")
+    monkeypatch.setattr(signature, "REJECTED_EVENT_LOG", tmp_path / "rejected_events.jsonl")
     s = JsonStorage(str(tmp_path / "storage.json"))
     app.dependency_overrides[get_storage] = lambda: s
     yield s
