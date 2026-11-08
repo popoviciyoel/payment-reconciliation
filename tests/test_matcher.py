@@ -64,6 +64,13 @@ def test_trailing_space_counts_as_exact():                    # observed: 'REF-2
     assert (a.payment_id, a.match_type) == ("p_9392", M.EXACT_REF)
 
 
+def test_spaces_for_dashes_counts_as_exact():                 # observed: 'PAY 2026 9788'
+    # Matches right away by reference, with no grace-period wait.
+    a = only(match(txn("PAY 2026 9788", "1092.33", "Global Tech Solutions"),
+                   PAYMENTS + [pay("p_9788", "PAY-2026-9788", "1092.33", "Global Tech Solutions")], TOL))
+    assert (a.payment_id, a.match_type) == ("p_9788", M.EXACT_REF)
+
+
 def test_partial_payment_links_full_transaction_amount():     # observed: REF-2026-2486
     a = only(match(txn("REF-2026-2486", "75.87", "Prime Logistics"), PAYMENTS, TOL))
     assert (a.payment_id, a.amount) == ("p_2486", D("75.87"))
@@ -356,11 +363,59 @@ def test_single_known_plus_missing_reference_also_waits():
     assert not r.matched
 
 
-def test_after_grace_allocates_across_existing_and_notes_missing():
+def test_after_grace_amount_beyond_known_payments_stays_unmatched():
+    # Previously p_4149 (356.13) took all 400.00 and the missing payment's share was lost.
     r = match(txn("ORD-2026-4149 ORD-2026-0001", "400.00", "Stellar Group"), PAYMENTS, TOL)
+    assert not r.matched
+    assert "ORD-2026-0001" in r.reason and "needs review" in r.reason
+
+
+def test_after_grace_one_known_of_two_references_does_not_take_everything():
+    payments = [pay("p1", "REF-2026-0001", "1000.00", "Acme")]
+    r = match(txn("REF-2026-0001 REF-2026-0002", "1500.00", "Acme"), payments, TOL)
+    assert not r.matched
+
+
+def test_after_grace_amount_that_fits_known_payment_is_allocated_with_note():
+    r = match(txn("ORD-2026-4149 ORD-2026-0001", "356.13", "Stellar Group"), PAYMENTS, TOL)
     [a] = r.allocations
-    assert (a.payment_id, a.amount) == ("p_4149", D("400.00"))
+    assert (a.payment_id, a.amount, a.match_type) == ("p_4149", D("356.13"), M.EXTRACTED_REF)
     assert "ORD-2026-0001 matched no payment after the grace period" in a.notes
+
+
+def test_after_grace_refund_naming_a_missing_reference_stays_unmatched():
+    payments = [pay("p1", "REF-2026-0001", "100.00", "Acme", received="100.00", linked=["100.00"])]
+    r = match(txn("REF-2026-0001 REF-2026-0002", "-100.00", "Acme"), payments, TOL)
+    assert not r.matched
+
+
+# ----------------------------------------------------------------- generic references inside text
+
+def test_generic_word_reference_does_not_steal_part_of_a_payment():
+    payments = [pay("p_word", "PAYMENT", "50.00", "Other Co"), pay("p_real", "REF-2026-0001", "100.00", "Acme")]
+    a = only(match(txn("PAYMENT REF-2026-0001", "100.00", "Acme"), payments, TOL))
+    assert (a.payment_id, a.amount, a.match_type) == ("p_real", D("100.00"), M.EXTRACTED_REF)
+
+
+def test_generic_word_reference_still_matches_exactly():
+    payments = [pay("p_word", "PAYMENT", "50.00", "Other Co")]
+    a = only(match(txn("payment", "50.00", "Other Co"), payments, TOL))
+    assert (a.payment_id, a.match_type) == ("p_word", M.EXACT_REF)
+
+
+# ----------------------------------------------------------------- refunds reverse each payment once
+
+def test_refund_cannot_take_received_below_zero():
+    # 100.00 still listed as unreversed (e.g. an earlier partial refund by reference), but only 70.00 received.
+    payments = [pay("p1", "R-1", "100.00", "Acme", received="70.00", linked=["100.00"])]
+    r = match(txn(None, "-100.00", "Acme"), payments, TOL)
+    assert not r.matched
+
+
+def test_fuzzy_refund_requires_unreversed_amount():
+    payments = [pay("p1", "R-1", "100.00", "Stellar Group", received="0.00", linked=())]
+    r = match(txn(None, "-100.00", "Stelar Group"), payments, TOL)
+    assert not r.matched
 
 
 # ----------------------------------------------------------------- tier 2c: one transaction, several invoices

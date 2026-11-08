@@ -213,3 +213,67 @@ def test_multi_reference_waits_for_missing_payment_then_splits(store):
     reconcile(store, TOL)
     assert {l["payment_id"]: l["amount"] for l in store.get_links_for_transaction("t1")} == {"p1": "100.00", "p2": "200.00"}
     assert store.get_payment("p1")["status"] == store.get_payment("p2")["status"] == "FULLY_PAID"
+
+
+def test_grace_counts_only_time_since_service_start(store):
+    """After an outage, a waiting transaction gets a full grace period of uptime."""
+    add_payment(store, "p_other", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "INV-2026-0999", "100.00", payer="ACME CORP")
+    restarted = LATER - timedelta(minutes=1)    # stored 16 min ago, but we were down until 1 min ago
+    assert reconcile(store, TOL, now=LATER, started_at=restarted).matched == 0
+    assert "waiting" in store.get_transaction("t1")["unmatched_reason"]
+    # The retried payment webhook lands during the new grace period.
+    add_payment(store, "p_right", "INV-2026-0999", "100.00", payer="Acme Corporation")
+    reconcile(store, TOL, now=LATER, started_at=restarted)
+    assert store.get_transaction("t1")["matched_payment_ids"] == ["p_right"]
+
+
+def test_grace_after_restart_eventually_falls_back(store):
+    add_payment(store, "p_other", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "November invoice", "100.00", payer="ACME CORP")
+    restarted = LATER - timedelta(minutes=1)
+    assert reconcile(store, TOL, now=LATER, started_at=restarted).matched == 0
+    assert reconcile(store, TOL, now=restarted + timedelta(minutes=15), started_at=restarted).matched == 1
+
+
+def test_duplicate_refund_reverses_a_payment_only_once(store):
+    add_payment(store, "p1", "INV-2026-0100", "100.00")
+    add_txn(store, "t1", "INV-2026-0100", "100.00", settled="2026-11-08T10:00:00")
+    add_txn(store, "r1", None, "-100.00", settled="2026-11-08T11:00:00")
+    add_txn(store, "r2", None, "-100.00", settled="2026-11-08T12:00:00")
+    reconcile(store, TOL)
+    assert store.get_transaction("r1")["matched_payment_ids"] == ["p1"]
+    assert not store.get_transaction("r2")["matched"]
+    p = store.get_payment("p1")
+    assert D(p["received_amount"]) == 0 and p["status"] == "PENDING"
+    # Same answer on a later run, when the views are rebuilt from stored links.
+    reconcile(store, TOL)
+    assert not store.get_transaction("r2")["matched"]
+
+
+def test_refund_after_repayment_can_match_again(store):
+    add_payment(store, "p1", "INV-2026-0100", "100.00")
+    add_txn(store, "t1", "INV-2026-0100", "100.00", settled="2026-11-08T10:00:00")
+    add_txn(store, "r1", None, "-100.00", settled="2026-11-08T11:00:00")
+    add_txn(store, "t2", "INV-2026-0100", "100.00", settled="2026-11-08T12:00:00")
+    add_txn(store, "r2", None, "-100.00", settled="2026-11-08T13:00:00")
+    reconcile(store, TOL)
+    assert store.get_transaction("r2")["matched_payment_ids"] == ["p1"]
+
+
+@pytest.mark.parametrize("split_runs", [False, True])
+def test_refund_outcome_does_not_depend_on_run_boundaries(store, split_runs):
+    # r1 refunds 100 by reference with no equal earlier amount (60 + 40). Refund
+    # cancellation pairs equal amounts regardless of order, so r1 cancels t3 and
+    # r2 has nothing left to reverse. In-run views and views rebuilt from stored
+    # links must agree on that.
+    add_payment(store, "p1", "INV-2026-0200", "200.00")
+    add_txn(store, "t1", "INV-2026-0200", "60.00", settled="2026-11-08T10:00:00")
+    add_txn(store, "t2", "INV-2026-0200", "40.00", settled="2026-11-08T11:00:00")
+    add_txn(store, "r1", "INV-2026-0200", "-100.00", settled="2026-11-08T12:00:00")
+    add_txn(store, "t3", "INV-2026-0200", "100.00", settled="2026-11-08T13:00:00")
+    if split_runs:
+        reconcile(store, TOL)
+    add_txn(store, "r2", None, "-100.00", settled="2026-11-08T14:00:00")
+    reconcile(store, TOL)
+    assert not store.get_transaction("r2")["matched"]

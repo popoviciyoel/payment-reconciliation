@@ -172,7 +172,7 @@ derived from this, not from guesses.
 | Case | Examples | Count |
 |---|---|---|
 | **Exact reference** | `ORD-2026-9137` → payment `ORD-2026-9137` | 20 of 27 |
-| **Noisy reference** | `INV REF-2026-6981` (prefix), `REF-2026-9392 ` (trailing space) | 2 |
+| **Noisy reference** | `INV REF-2026-6981` (prefix), `REF-2026-9392 ` (trailing space); later data: `PAY 2026 9788` (spaces for dashes) | 2 (+1) |
 | **Missing reference** | `''` 4153.15 Apex = ORD-2026-2811 exactly; `''` 356.13 Stellar = ORD-2026-4149 exactly | 2 |
 | **Placeholder reference** | `UNKNOWN-DD9DED6E` (96.94 Pinnacle), `UNKNOWN-2B943F38` (381.86 Apex), `UNKNOWN-680664DF` (207.00 Vertex) | 3 |
 | **Partial payments summing exactly** | ORD-2026-5866: 428.68 + 730.88 = 1159.56; ORD-2026-3701: 2804.18 + 1427.64 = 4231.82; REF-2026-2486: 53.80 + 75.87 + 114.31 = 243.98 | 3 payments |
@@ -187,7 +187,9 @@ derived from this, not from guesses.
   reference had the shape `(REF|ORD|PAY|INV)-YYYY-NNNN`, and finding the reference inside
   noisy text fixes both noisy cases. The matcher does **not** depend on that shape
   (§5) — it's one sample, and other providers or test data will differ. No typo'd
-  references were observed, so edit-distance matching is not needed yet.
+  references were observed, so edit-distance matching is not needed yet. Other separators
+  are not typos: `PAY 2026 9788`, `INV_2026_1234` and `REF - 2026 - 0001` are rewritten
+  to the dash form during normalization, so they match exactly.
 - **Payer name alone must never decide a match.** Most payers have several open payments.
   The `UNKNOWN-*` transactions match no outstanding balance; forcing a name match would
   misallocate money.
@@ -232,11 +234,11 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
 
 | Tier | Rule | `match_type` |
 |---|---|---|
-| 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for known payment references as whole tokens (min length 4), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
-| 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last. If a well-formed reference in the text has no payment yet, wait out the grace period first, then allocate across the payments that exist | `MULTI_REF` (not yet observed) |
+| 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for identifier-like known payment references as whole tokens (must contain a digit and be at least 4 characters, so `PAYMENT` never matches ordinary words; all-digit references like `10423` count), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
+| 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last. If a well-formed reference in the text has no payment yet, wait out the grace period first; after it, allocate across the payments that exist **only if the amount fits their remaining balances** (otherwise leave unmatched for review, so the missing payment's share isn't lost to a permanent link) | `MULTI_REF` (not yet observed) |
 | 2 | No usable ref — empty or placeholder (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its grace period has passed: same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
 | 2c | Exact payer, no single payment fits, positive amount: amount **exactly** equals the combined remaining balances of 2–3 of that payer's open payments (`PENDING`/`PARTIALLY_PAID` by status, so a fee shortfall on a `FULLY_PAID` payment is never treated as a balance), and **exactly one** such combination. Balances not smaller than the amount are pruned first; searched only when ≤ 30 candidates remain, and stops at the second combination found | `MULTI_NAME_AMOUNT` |
-| 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
+| 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount not yet refunded); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
 | 3 | Nothing confident → leave unmatched, surfaced in the unmatched list | — |
 
 - **References are format-agnostic.** An earlier version only recognised the observed
@@ -248,19 +250,25 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
 - **A reference that matches no payment waits, then falls back.** References aren't always
   informative (free text such as "November invoice"), so such a transaction may still be
   matched on payer + amount — but only after a **grace period** (`REFERENCE_GRACE_MINUTES`,
-  default 15) measured from when *we received it*, giving the referenced payment time to
-  arrive. Empty and placeholder references fall back immediately. Fallback links keep
+  default 15) measured from when *we received it* or when the service last started,
+  whichever is later, giving the referenced payment time to arrive. Empty and placeholder references fall back immediately. Fallback links keep
   their tier's match type and note `reference '…' matched no payment`.
   - *Why wait:* falling back immediately put money on the wrong invoice whenever a
     transaction arrived before its payment. The simulation suite showed it on 5 shuffled
     datasets — e.g. `txn_sim5_0015` (ref `PAY-2026-8701`, position 14) linked to another
     Prime Logistics payment within tolerance, while its real payment arrived at position 79.
   - *Why receipt time:* the provider's `settled_at` can be old or skewed and would skip the wait.
+  - *Why also service start:* while we're down, the payment webhook can't arrive (it's in
+    the sender's retry queue), so downtime must not count as waiting. Otherwise the
+    reconcile at startup would fall back on everything stored before an outage.
   - *Periodic runs:* matching normally runs on new events; a timer
     (`RECONCILE_INTERVAL_SECONDS`, default 60) re-runs it so waiting transactions get their
     fallback even when the stream is quiet.
   - *Residual risk:* a payment arriving *after* the grace period still loses its
     transaction to an earlier fallback (Q9).
+- **Each payment can be refunded once per amount.** A reference-less refund must reverse an
+  amount linked to the payment and not already cancelled by an equal refund, and may not
+  take `received` below zero. A duplicate refund stays unmatched for review.
 - In tier 1 the reference wins even if the payer name differs; name similarity is
   recorded on the link as a confidence signal, not used as a gate.
 - **One transaction, several payments.** Two ways, both synthetic-only so far (not yet seen
@@ -279,6 +287,7 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
   never runs when an exact-name payer exists, so it can't redirect money to a
   different but similar payer.
 - Fuzzy (edit-distance) *reference* matching is deferred until the data shows typos.
+  Separator variants of well-formed references (spaces, `_`, `.`, `/`) are normalized to dashes.
 - Links are immutable once made, so results are reproducible and explainable.
 
 ### Status

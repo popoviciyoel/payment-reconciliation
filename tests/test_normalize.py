@@ -21,6 +21,11 @@ from app.reconciliation.normalize import (
     ("", []),
     (None, []),
     ("REF-26-1", []),                                 # malformed
+    ("PAY 2026 9788", ["PAY-2026-9788"]),            # observed spaces for dashes
+    ("inv_2026_1234 / ref.2026.0001", ["INV-2026-1234", "REF-2026-0001"]),
+    ("REF - 2026 - 0001", ["REF-2026-0001"]),
+    ("PAY20269788", []),                              # no separators: not rewritten
+    ("XPAY 2026 9788", []),                           # inside a longer token
 ])
 def test_pattern_references_found_without_known_payments(raw, expected):
     assert find_references(normalize_reference(raw) or "", []) == expected
@@ -30,6 +35,8 @@ def test_normalize_reference():
     assert normalize_reference("  ref-1 ") == "REF-1"
     assert normalize_reference("   ") is None
     assert normalize_reference(None) is None
+    assert normalize_reference(" pay 2026 9788 ") == "PAY-2026-9788"
+    assert normalize_reference("INV REF 2026 6981") == "INV REF-2026-6981"
 
 
 @pytest.mark.parametrize("a, b", [
@@ -87,4 +94,15 @@ def test_find_references_drops_reference_nested_in_a_longer_one():
 
 
 def test_find_references_keeps_short_reference_that_also_stands_alone():
-    assert find_references("REF-2026-1234 AND 1234", ["REF-2026-1234", "1234"]) == ["REF-2026-1234", "1234"]
+    assert find_references("PO-123456-7 AND 123456", ["PO-123456-7", "123456"]) == ["PO-123456-7", "123456"]
+
+
+@pytest.mark.parametrize("generic", ["PAYMENT", "INVOICE", "ACME", "A12"])
+def test_generic_known_reference_is_not_searched_inside_text(generic):
+    # Words appear in ordinary bank text; only references with a digit (and long enough) count.
+    assert find_references(f"{generic} REF-2026-0001", [generic, "REF-2026-0001"]) == ["REF-2026-0001"]
+
+
+@pytest.mark.parametrize("ref", ["ABC123", "A1B2", "104233", "10423", "1234"])
+def test_identifier_like_known_reference_is_searched_inside_text(ref):
+    assert find_references(f"PAID {ref} THANKS", [ref]) == [ref]

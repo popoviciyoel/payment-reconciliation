@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _reconcile_lock = Lock()
 
+# The reference grace period only counts time this process was up and able to
+# receive webhooks: after an outage, the payment webhook may still be in retry.
+_SERVICE_STARTED_AT = datetime.now()
+
 
 def default_tolerance() -> Tolerance:
     return Tolerance(percent=settings.fee_tolerance_percent, fixed=settings.fee_tolerance_fixed)
@@ -65,28 +69,32 @@ def _payment_views(storage: JsonStorage) -> dict[str, PaymentView]:
             currency=p.get("currency") or "USD",
             payer_name=p.get("payer_name"),
             received=sum(amounts, Decimal("0")),
-            linked_amounts=tuple(a for a in amounts if a > 0),
+            linked_amounts=tuple(amounts),
         )
     return views
 
 
-def _grace_elapsed(t: dict, now: datetime, grace: timedelta) -> bool:
-    """Has this transaction waited out the reference grace period since we received it?"""
+def _grace_elapsed(t: dict, now: datetime, grace: timedelta, started_at: datetime) -> bool:
+    """
+    Has this transaction waited out the reference grace period while we were up?
+    Counted from receipt or service start, whichever is later; with no usable
+    receipt time, from service start (still finite, so nothing blocks forever).
+    """
     try:
         received = datetime.fromisoformat(t["created_at"])
     except (KeyError, TypeError, ValueError):
-        return True  # no usable receipt time: don't block forever
-    return now - received >= grace
+        received = started_at
+    return now - max(received, started_at) >= grace
 
 
-def _transaction_view(t: dict, now: datetime, grace: timedelta) -> TransactionView:
+def _transaction_view(t: dict, now: datetime, grace: timedelta, started_at: datetime) -> TransactionView:
     return TransactionView(
         transaction_id=t["transaction_id"],
         reference=t.get("reference"),
         amount=_dec(t.get("amount")),
         currency=t.get("currency") or "USD",
         payer_name=t.get("payer_name"),
-        reference_fallback_allowed=_grace_elapsed(t, now, grace),
+        reference_fallback_allowed=_grace_elapsed(t, now, grace, started_at),
     )
 
 
@@ -126,11 +134,13 @@ def reconcile(
     storage: JsonStorage,
     tolerance: Tolerance | None = None,
     now: datetime | None = None,
+    started_at: datetime | None = None,
 ) -> ReconcileReport:
     """Match every unmatched transaction that can now be matched."""
     tolerance = tolerance or default_tolerance()
     # Storage timestamps are naive local time (datetime.now()); compare like with like.
     now = now or datetime.now()
+    started_at = started_at or _SERVICE_STARTED_AT
     grace = timedelta(minutes=settings.reference_grace_minutes)
     with _reconcile_lock:
         payments = _payment_views(storage)
@@ -148,7 +158,7 @@ def reconcile(
                 _refresh_payments(storage, _repair_flag(storage, t["transaction_id"]), tolerance)
                 continue
 
-            result = match(_transaction_view(t, now, grace), list(payments.values()), tolerance, settings.fuzzy_name_threshold)
+            result = match(_transaction_view(t, now, grace, started_at), list(payments.values()), tolerance, settings.fuzzy_name_threshold)
 
             if not result.matched:
                 if t.get("unmatched_reason") != result.reason:
@@ -163,7 +173,7 @@ def reconcile(
                 updated[a.payment_id] = replace(
                     p,
                     received=p.received + a.amount,
-                    linked_amounts=p.linked_amounts + ((a.amount,) if a.amount > 0 else ()),
+                    linked_amounts=p.linked_amounts + (a.amount,),
                 )
             payment_ids = list(dict.fromkeys(a.payment_id for a in result.allocations))
             storage.record_match(

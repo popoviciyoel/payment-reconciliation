@@ -11,6 +11,12 @@ import re
 from difflib import SequenceMatcher
 
 REFERENCE_PATTERN = re.compile(r"\b(?:REF|ORD|PAY|INV)-\d{4}-\d{4}\b")
+# The same reference written with other separators (`PAY 2026 9788`, `INV_2026_1234`,
+# `REF - 2026 - 0001`). At least one separator between parts, so `PAY20269788` and
+# tokens embedded in longer words are left alone.
+_LOOSE_REFERENCE = re.compile(
+    r"(?<![0-9A-Z])(REF|ORD|PAY|INV)[\s_./-]+(\d{4})[\s_./-]+(\d{4})(?![0-9A-Z])"
+)
 
 # Legal-entity suffixes stripped from the end of payer names.
 _NAME_SUFFIXES = frozenset({
@@ -21,10 +27,10 @@ _DIGITS = re.compile(r"\d+")
 
 
 def normalize_reference(raw: str | None) -> str | None:
-    """Trim and uppercase; empty becomes None."""
+    """Trim, uppercase and write well-formed references with dashes; empty becomes None."""
     if raw is None:
         return None
-    cleaned = raw.strip().upper()
+    cleaned = _LOOSE_REFERENCE.sub(r"\1-\2-\3", raw.strip().upper())
     return cleaned or None
 
 
@@ -37,6 +43,16 @@ _PLACEHOLDER_PREFIXES = ("UNKNOWN-", "UNKNOWN ")
 MIN_EMBEDDED_REFERENCE_LENGTH = 4
 
 
+def searchable_inside_text(ref: str) -> bool:
+    """
+    Is this known reference distinctive enough to look for inside longer text?
+    It must contain a digit: a reference with none ("PAYMENT", "INVOICE", "ACME")
+    would match ordinary words in bank text. All-digit references ("10423") count.
+    Exact equality has no such limit.
+    """
+    return len(ref) >= MIN_EMBEDDED_REFERENCE_LENGTH and any(c.isdigit() for c in ref)
+
+
 def is_placeholder_reference(normalized: str | None) -> bool:
     """True for empty / placeholder references that carry no matching signal."""
     if not normalized:
@@ -47,7 +63,8 @@ def is_placeholder_reference(normalized: str | None) -> bool:
 def find_references(normalized_text: str, known_references) -> list[str]:
     """
     References found inside free text, ordered by position, without duplicates:
-      - any known payment reference appearing as a whole token (any format), and
+      - any identifier-like known payment reference (see `searchable_inside_text`)
+        appearing as a whole token, and
       - any well-formed `(REF|ORD|PAY|INV)-YYYY-NNNN` reference (even if no payment
         has it yet, so the caller can wait for that payment).
     `normalized_text` and `known_references` must already be normalized.
@@ -57,7 +74,7 @@ def find_references(normalized_text: str, known_references) -> list[str]:
     """
     spans: dict[str, list[tuple[int, int]]] = {}
     for ref in known_references:
-        if len(ref) < MIN_EMBEDDED_REFERENCE_LENGTH:
+        if not searchable_inside_text(ref):
             continue
         found = [
             m.span()

@@ -12,15 +12,18 @@ Tiers, tried in order; the first that yields an unambiguous answer wins
            one hit                                  -> EXTRACTED_REF
            several hits                             -> MULTI_REF, spread across balances
          If a well-formed reference in the text has no payment yet, wait out the
-         grace period first, then allocate across the payments that exist.
+         grace period first. After it, allocate across the payments that exist
+         only if the amount fits their remaining balances; otherwise leave it
+         for review (the missing payment would lose its share for good).
        - reference but no payment has it            -> wait out a grace period (the
          payment may not have arrived yet), then fall through to tier 2, since
          references aren't always informative; link notes record the fallback
   2. No usable reference (empty, placeholder, or matching no payment):
        - payment: same normalized payer + amount within tolerance of the
                   remaining balance                                -> NAME_AMOUNT
-       - refund:  same normalized payer + magnitude equals a payment
-                  previously linked to that payer's payment         -> REFUND_NAME_AMOUNT
+       - refund:  same normalized payer + magnitude equals an amount linked
+                  to that payer's payment and not yet refunded, and
+                  no more than it has received                      -> REFUND_NAME_AMOUNT
        Only when exactly one payment qualifies.
   2c. Exact payer, no single payment fits, amount > 0: amount *exactly* equals
        the combined remaining balances of 2-3 of that payer's open payments, and
@@ -28,12 +31,13 @@ Tiers, tried in order; the first that yields an unambiguous answer wins
   2b. Only if tier 2 found no candidate at all: payer name *similar*
        (similarity >= threshold, same numbers in both names) + amount
        *exactly* equal to the remaining balance (refund: exactly reverses an
-       earlier linked amount). A weaker name signal demands a stronger amount
+       earlier linked amount not yet refunded). A weaker name signal demands a stronger amount
        signal, so no fee tolerance here.                   -> FUZZY_NAME_AMOUNT
        Only when exactly one payment qualifies.
   3. Otherwise unmatched, with a reason.
 """
 
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from decimal import Decimal
@@ -55,6 +59,19 @@ DEFAULT_NAME_SIMILARITY_THRESHOLD = 0.85
 # open payments per payer we'll search combinations of (C(30, 3) = 4060).
 MAX_PAYMENTS_PER_TRANSACTION = 3
 MAX_OPEN_PAYMENTS_FOR_COMBINATIONS = 30
+
+
+def unreversed(amounts) -> tuple[Decimal, ...]:
+    """Positive amounts not yet cancelled by a refund of the same size.
+
+    The only definition of refund cancellation: used both for views rebuilt from
+    stored links and for views updated during a run, so they always agree.
+    """
+    left = Counter(a for a in amounts if a > 0)
+    for a in amounts:
+        if a < 0 and left[-a] > 0:
+            left[-a] -= 1
+    return tuple(left.elements())
 
 
 class MatchType(str, Enum):
@@ -87,8 +104,18 @@ class PaymentView:
     currency: str
     payer_name: str | None
     received: Decimal = Decimal("0")
-    # Positive amounts already linked to this payment (lets refunds find what they reverse).
+    # Every amount linked to this payment (refunds negative), in link order.
     linked_amounts: tuple[Decimal, ...] = ()
+
+    @property
+    def unreversed_amounts(self) -> tuple[Decimal, ...]:
+        """Positive linked amounts not yet cancelled by a refund of the same size
+        (lets refunds find what they reverse, and only once)."""
+        return unreversed(self.linked_amounts)
+
+    def can_refund(self, amount: Decimal) -> bool:
+        """Could a refund of `amount` (> 0) reverse an earlier payment here?"""
+        return amount in self.unreversed_amounts and amount <= self.received
 
     @property
     def remaining(self) -> Decimal:
@@ -130,7 +157,7 @@ def match(
     if is_placeholder_reference(ref):
         return _match_by_name_and_amount(txn, payments, tolerance, name_threshold)
 
-    result = _match_by_reference(txn, ref, payments)
+    result = _match_by_reference(txn, ref, payments, tolerance)
     if result is not None:
         return result
 
@@ -150,7 +177,9 @@ def match(
 # --------------------------------------------------------------------------- tier 1
 
 
-def _match_by_reference(txn: TransactionView, ref: str, payments: list[PaymentView]) -> MatchResult | None:
+def _match_by_reference(
+    txn: TransactionView, ref: str, payments: list[PaymentView], tolerance: Tolerance
+) -> MatchResult | None:
     """Match on reference; None if no payment has any reference found in the text."""
     by_ref: dict[str, list[PaymentView]] = {}
     for p in payments:
@@ -175,12 +204,23 @@ def _match_by_reference(txn: TransactionView, ref: str, payments: list[PaymentVi
     if not hits:
         return None
 
-    if missing and not txn.reference_fallback_allowed:
+    if missing:
         # Some referenced payments exist, others haven't arrived: don't give the
         # whole amount to the ones we know about yet.
-        return _unmatched(
-            f"reference {', '.join(missing)} matched no payment yet; waiting for it before allocating"
-        )
+        if not txn.reference_fallback_allowed:
+            return _unmatched(
+                f"reference {', '.join(missing)} matched no payment yet; waiting for it before allocating"
+            )
+        # After the grace period, a missing well-formed reference still suggests a
+        # missing payment. Links are permanent, so allocate only when the amount
+        # alone fits what the known payments still owe; otherwise wait for review.
+        # Each run re-checks, so a late payment still gets its share.
+        known_remaining = sum((max(p.remaining, Decimal("0")) for p in hits), Decimal("0"))
+        if txn.amount < 0 or not tolerance.covers(txn.amount, known_remaining):
+            return _unmatched(
+                f"text names {', '.join(missing)}, which matches no payment, and amount {txn.amount} "
+                f"doesn't fit the remaining {known_remaining} of the referenced payments; needs review"
+            )
 
     wrong_currency = [p for p in hits if p.currency != txn.currency]
     if wrong_currency:
@@ -255,7 +295,7 @@ def _match_by_name_and_amount(
             match_type = MatchType.NAME_AMOUNT
             note = "no usable reference; payer and amount match remaining balance"
         else:
-            fits = [p for p in same_payer if -txn.amount in p.linked_amounts]
+            fits = [p for p in same_payer if p.can_refund(-txn.amount)]
             match_type = MatchType.REFUND_NAME_AMOUNT
             note = "refund with no usable reference; reverses an equal earlier payment from this payer"
 
@@ -348,8 +388,8 @@ def _match_by_similar_name(
         fits = [(p, s) for p, s in similar if p.remaining > 0 and txn.amount == p.remaining]
         what = "amount exactly matches remaining balance"
     else:
-        fits = [(p, s) for p, s in similar if -txn.amount in p.linked_amounts]
-        what = "refund exactly reverses an earlier linked amount"
+        fits = [(p, s) for p, s in similar if p.can_refund(-txn.amount)]
+        what = "refund exactly reverses an earlier linked amount not yet refunded"
 
     if not fits:
         names = ", ".join(sorted({repr(p.payer_name) for p, _ in similar}))
