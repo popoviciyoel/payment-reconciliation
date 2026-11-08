@@ -163,7 +163,8 @@ deterministic engine decides, and a human approves anything in between.
 ## 4. Observed provider data
 
 Snapshot from the live mock provider on 2026-11-08 (20 unique payments, 27 unique
-transactions, all USD), captured in `data/raw_events.jsonl`. The matching design in §5 is
+transactions, all USD), captured in `data/raw_events.jsonl` (git-ignored; committed as
+`tests/fixtures/observed_events.jsonl`). The matching design in §5 is
 derived from this, not from guesses.
 
 ### Reconciliation cases

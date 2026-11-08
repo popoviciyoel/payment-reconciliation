@@ -45,6 +45,13 @@ uvicorn app.main:app --reload --port 8000
 ngrok http 8000                     # in another terminal
 ```
 
+Or with Docker (reads `.env`, keeps data in `./data`):
+
+```bash
+docker compose up --build
+docker compose run --rm api pytest  # run the tests in the container
+```
+
 ### Connect to the mock provider
 
 ```bash
@@ -105,6 +112,7 @@ Interactive docs: **http://localhost:8000/docs** (Swagger UI) or `/redoc`.
 | `POST` | `/webhooks/transactions` | Receive `transaction.settled` |
 | `GET` | `/payments` | All payments with status and linked transactions, unmatched transactions (with the reason), and summary statistics |
 | `GET` | `/payments/{payment_id}` | One payment with its linked transactions (404 if unknown) |
+| `GET` | `/ui` | Browser view of the query API: payments, statuses, linked and unmatched transactions |
 | `GET` | `/` | Health check |
 
 `GET /payments` query parameters: `status` (`PENDING`, `PARTIALLY_PAID`, `FULLY_PAID`,
@@ -163,7 +171,8 @@ key decisions:
 
 ### Matching was derived from real data, not guessed
 Before writing the matcher, I connected to the provider and logged every event
-(`data/raw_events.jsonl`). The first 20 payments and 27 transactions showed exact
+(`data/raw_events.jsonl`, git-ignored; the captured events are committed as
+`tests/fixtures/observed_events.jsonl`). The first 20 payments and 27 transactions showed exact
 references, noisy references (`INV REF-2026-6981`, trailing spaces), blank references,
 `UNKNOWN-*` placeholders, partial payments, slightly short amounts, and payer-name
 variants (`apex trading co`, `Pacific Ventures LLC`). The tiers below are built from
@@ -298,7 +307,6 @@ and run on demand or on a schedule rather than per webhook.
   would each enforce their own limit; move them to Redis or an API gateway. (Single-process
   rate limiting is built — see DESIGN.md §3.)
 - Cursor-based pagination, and API authentication for the query endpoints.
-- Docker / docker-compose.
 - Structured logs and metrics (match rate, unmatched amount, webhook latency, signature
   failures).
 - Retire the provided single-ID `matched_to_payment_id` field in favour of
@@ -341,7 +349,8 @@ including how to weigh each trade-off, were mine.
 **What AI did**
 - **Wrote code:** the application code and tests, built from the design I set, one change
   at a time, with each change reviewed by me.
-- **Analyzed the raw webhook data:** worked through `data/raw_events.jsonl` to classify
+- **Analyzed the raw webhook data:** worked through the raw event log (committed as
+  `tests/fixtures/observed_events.jsonl`) to classify
   the reconciliation cases (noisy, missing and placeholder references; partial payments;
   short payments; payer-name variants), compare duplicate deliveries, and measure
   payer-name similarity. I used that analysis to decide the matching tiers and thresholds.
