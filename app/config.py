@@ -6,6 +6,7 @@ This file is PROVIDED - loads configuration from environment variables.
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,11 @@ class Settings:
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
     debug: bool = os.getenv("DEBUG", "false").lower() == "true"
+
+    # Reconciliation: how far below the expected amount still counts as paid
+    # (fee deductions). The allowance is the larger of the two.
+    fee_tolerance_percent: Decimal = Decimal(os.getenv("FEE_TOLERANCE_PERCENT", "2"))
+    fee_tolerance_fixed: Decimal = Decimal(os.getenv("FEE_TOLERANCE_FIXED", "0"))
 
 
 # Singleton settings instance
