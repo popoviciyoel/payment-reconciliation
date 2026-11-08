@@ -19,9 +19,12 @@ Tiers, tried in order; the first that yields an unambiguous answer wins
          payment may not have arrived yet), then fall through to tier 2, since
          references aren't always informative; link notes record the fallback
   1c. Reference matching no payment, after the grace period: within
-       `reference_max_edits` typos of exactly one payment's reference, with the
-       payer agreeing and the amount fitting                -> FUZZY_REF
-       Otherwise fall through to tier 2.
+       `reference_max_edits` typos of exactly one open payment's reference, with
+       the payer agreeing and the amount fitting            -> FUZZY_REF
+       A well-formed reference may be a different invoice whose payment is
+       missing, so it must settle the remaining balance (within tolerance);
+       a malformed one may be a partial payment. If payer + amount points at a
+       different payment, leave it for review. Otherwise fall through to tier 2.
   2. No usable reference (empty, placeholder, or matching no payment):
        - payment: same normalized payer + amount within tolerance of the
                   remaining balance                                -> NAME_AMOUNT
@@ -55,6 +58,7 @@ from app.reconciliation.normalize import (
     normalize_name,
     normalize_reference,
     numbers_agree,
+    REFERENCE_PATTERN,
     reference_distance,
 )
 
@@ -182,9 +186,16 @@ def match(
     if not txn.reference_fallback_allowed:
         return _unmatched(f"{context} yet; waiting for it before matching on payer + amount")
     typo = _match_by_reference_typo(txn, ref, payments, tolerance, name_threshold, reference_max_edits)
-    if typo is not None:
-        return typo
     fallback = _match_by_name_and_amount(txn, payments, tolerance, name_threshold)
+    if typo is not None:
+        typo_ids = {a.payment_id for a in typo.allocations}
+        if fallback.matched and {a.payment_id for a in fallback.allocations} != typo_ids:
+            # The near-miss reference and the payer + amount disagree: neither is safe.
+            return _unmatched(
+                f"{context}; it is a typo away from {typo.allocations[0].payment_id}, but payer and "
+                f"amount match {', '.join(a.payment_id for a in fallback.allocations)}; needs review"
+            )
+        return typo
     if fallback.matched:
         return MatchResult(tuple(
             replace(a, notes=f"{context}; {a.notes}") for a in fallback.allocations
@@ -278,8 +289,11 @@ def _match_by_reference_typo(
     grace period (the caller checks), so a reference to a payment that simply
     hasn't arrived isn't redirected to its near-identical neighbour. One digit
     also separates *different* invoices (`...-6981` vs `...-6982`), so the
-    distance alone never decides: the payer must agree, the amount must fit, and
-    exactly one payment may qualify. None means fall through to payer + amount.
+    distance alone never decides: the payer must agree, the payment must still be
+    open, the amount must fit, and exactly one payment may qualify. A well-formed
+    target (`(REF|ORD|PAY|INV)-YYYY-NNNN`) may itself be a missing invoice, and links
+    are permanent, so it must settle the remaining balance within tolerance; a
+    malformed one may be a partial payment. None means fall through to payer + amount.
     """
     if max_edits <= 0:
         return None
@@ -288,6 +302,7 @@ def _match_by_reference_typo(
     if len(targets) != 1:
         return None
     target = targets[0]
+    well_formed = REFERENCE_PATTERN.fullmatch(target) is not None
 
     fits = []
     for p in payments:
@@ -301,9 +316,14 @@ def _match_by_reference_typo(
             and name_similarity(txn.payer_name, p.payer_name) >= name_threshold
         ):
             continue
-        amount_fits = (
-            0 < txn.amount <= p.remaining if txn.amount > 0 else p.can_refund(-txn.amount)
-        )
+        if txn.amount < 0:
+            amount_fits = p.can_refund(-txn.amount)
+        elif compute_status(p.amount_due, p.received, tolerance) not in _OPEN_STATUSES:
+            amount_fits = False  # already settled (possibly within the fee tolerance)
+        elif well_formed:
+            amount_fits = tolerance.covers(txn.amount, p.remaining)
+        else:
+            amount_fits = txn.amount <= p.remaining
         if amount_fits:
             fits.append((p, distance))
 
@@ -316,8 +336,14 @@ def _match_by_reference_typo(
         match_type=MatchType.FUZZY_REF,
         notes=(f"reference {target!r} is {distance} typo(s) from {p.reference!r} (max {max_edits}); "
                f"payer name similarity {name_similarity(txn.payer_name, p.payer_name)}; "
-               f"amount fits {'the remaining balance' if txn.amount > 0 else 'an earlier payment'}"),
+               f"amount {_typo_amount_note(txn, well_formed)}"),
     ),))
+
+
+def _typo_amount_note(txn: TransactionView, well_formed: bool) -> str:
+    if txn.amount < 0:
+        return "reverses an earlier payment"
+    return "settles the remaining balance" if well_formed else "fits the remaining balance"
 
 
 def _ref_notes(txn: TransactionView, p: PaymentView, exact: bool) -> str:

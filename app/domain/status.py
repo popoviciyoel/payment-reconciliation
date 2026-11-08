@@ -70,8 +70,10 @@ def compute_status(amount_due: Decimal, received: Decimal, tolerance: Tolerance)
     """Status from net received against the amount due (see `settle`)."""
     if received > amount_due:
         return PaymentStatus.OVERPAID
+    # Before the tolerance check: nothing received never counts as paid while
+    # something is still due, however large the fee allowance.
+    if received <= 0 < amount_due:
+        return PaymentStatus.PENDING
     if received >= amount_due - tolerance.allowance(amount_due):
         return PaymentStatus.FULLY_PAID  # also a fully refunded payment: nothing is owed
-    if received <= 0:
-        return PaymentStatus.PENDING
     return PaymentStatus.PARTIALLY_PAID

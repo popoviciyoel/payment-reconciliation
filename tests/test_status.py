@@ -60,3 +60,9 @@ def test_settle_applies_refunds(amounts, due, received, status):
     s = settle(D("100.00"), [D(a) for a in amounts])
     assert (s.amount_due, s.received) == (D(due), D(received))
     assert compute_status(s.amount_due, s.received, Tolerance()) is status
+
+
+def test_nothing_received_is_pending_even_within_the_fee_allowance():
+    # Review regression: a fixed allowance larger than the amount due.
+    assert compute_status(D("3.00"), D("0"), Tolerance(fixed=D("5"))) is S.PENDING
+    assert compute_status(D("3.00"), D("-1.00"), Tolerance(fixed=D("5"))) is S.PENDING

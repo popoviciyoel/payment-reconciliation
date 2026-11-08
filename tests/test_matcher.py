@@ -498,14 +498,49 @@ def test_typo_in_reference_matches_when_payer_and_amount_agree():
 
 
 def test_typo_inside_noisy_text_matches():
-    a = only(match(txn("INV REF-2026-6918", "2000.00", "Quantum Dynamics"), PAYMENTS, TOL))
-    assert (a.payment_id, a.match_type, a.amount) == ("p_6981", M.FUZZY_REF, D("2000.00"))
+    a = only(match(txn("INV REF-2026-6918", "4670.75", "Quantum Dynamics"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type, a.amount) == ("p_6981", M.FUZZY_REF, D("4670.75"))
 
 
-def test_typo_allows_partial_payment_but_not_overpayment():
-    assert only(match(txn("REF-2026-6918", "100.00", "Quantum Dynamics"), PAYMENTS, TOL)).payment_id == "p_6981"
-    r = match(txn("REF-2026-6918", "9000.00", "Quantum Dynamics"), PAYMENTS, TOL)
+def test_well_formed_typo_must_settle_the_balance():
+    # REF-2026-6918 may be a different invoice whose payment is missing; links are
+    # permanent, so a partial amount isn't enough evidence that it meant 6981.
+    assert not match(txn("REF-2026-6918", "100.00", "Quantum Dynamics"), PAYMENTS, TOL).matched
+    assert not match(txn("REF-2026-6918", "9000.00", "Quantum Dynamics"), PAYMENTS, TOL).matched
+    # Within the fee tolerance still settles it.
+    assert only(match(txn("REF-2026-6918", "4600.00", "Quantum Dynamics"), PAYMENTS, TOL)).payment_id == "p_6981"
+
+
+def test_malformed_typo_allows_partial_payment_but_not_overpayment():
+    # A digit dropped: not a well-formed reference, so not another invoice's.
+    a = only(match(txn("REF-2026-698", "100.00", "Quantum Dynamics"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_6981", M.FUZZY_REF)
+    assert not match(txn("REF-2026-698", "9000.00", "Quantum Dynamics"), PAYMENTS, TOL).matched
+
+
+def test_missing_invoice_is_not_redirected_to_its_neighbour():
+    # Review case: INV-2026-6982's payment is missing; 6981 (same payer) has room for it.
+    payments = [
+        pay("p_6981", "INV-2026-6981", "1000.00", "Acme"),
+        pay("p_b", "ORD-2026-5555", "300.00", "Acme"),
+    ]
+    a = only(match(txn("INV-2026-6982", "300.00", "Acme"), payments, TOL))
+    assert (a.payment_id, a.match_type) == ("p_b", M.NAME_AMOUNT)  # exact payer + amount wins
+
+
+def test_typo_and_payer_amount_disagreeing_is_left_for_review():
+    payments = [
+        pay("p_6981", "INV-2026-6981", "1000.00", "Acme"),
+        pay("p_b", "ORD-2026-5555", "300.00", "Acme"),
+    ]
+    r = match(txn("INV-2026-698", "300.00", "Acme"), payments, TOL)
     assert not r.matched
+    assert "p_6981" in r.reason and "p_b" in r.reason and "needs review" in r.reason
+
+
+def test_typo_never_matches_a_payment_settled_within_tolerance():
+    payments = [pay("p_1000", "REF-2026-1000", "1000.00", "Acme", received="985.00", linked=["985.00"])]
+    assert not match(txn("REF-2026-100", "10.00", "Acme"), payments, TOL).matched
 
 
 def test_near_reference_of_another_payer_never_matches():
