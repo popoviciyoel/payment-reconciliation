@@ -5,8 +5,10 @@ Payment Reconciliation Service
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from app.api import payments, webhooks
 from app.config import settings
@@ -70,3 +72,12 @@ app.include_router(payments.router)
 def root():
     """Health check"""
     return {"status": "healthy", "service": "reconciliation-service"}
+
+
+UI_PAGE = Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/ui", include_in_schema=False)
+def ui():
+    """Browser view of GET /payments (summary, payments, linked and unmatched transactions)."""
+    return FileResponse(UI_PAGE)

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconciliation Viewer</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5f6b7a; --border: #dfe3e8;
+    --accent: #2f6fde; --row-hover: #f1f4f9; --code-bg: #f3f5f8;
+    --pending: #6b7280; --partial: #b45309; --paid: #15803d; --over: #7c3aed; --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #171b21; --text: #e6e9ee; --muted: #98a2b3; --border: #2a3039;
+      --accent: #6c9cf0; --row-hover: #1e232b; --code-bg: #11151a;
+      --pending: #9ca3af; --partial: #f59e0b; --paid: #4ade80; --over: #c4a5fd; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 18px 0 10px; }
+  input, select, button { font: inherit; color: var(--text); background: var(--panel);
+         border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+  input[type=search] { flex: 1 1 220px; min-width: 0; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr.row { cursor: pointer; }
+  tbody tr.row:hover { background: var(--row-hover); }
+  tr.detail td { background: var(--code-bg); white-space: normal; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+           border: 1px solid currentColor; }
+  .PENDING { color: var(--pending); } .PARTIALLY_PAID { color: var(--partial); }
+  .FULLY_PAID { color: var(--paid); } .OVERPAID { color: var(--over); }
+  .neg { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; padding: 10px; }
+  .error { color: var(--bad); padding: 12px; }
+  details.raw { margin-top: 28px; }
+  details.raw summary { cursor: pointer; font-weight: 600; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+        overflow: auto; max-height: 520px; margin: 10px 0 0; }
+  .inner th, .inner td { border-bottom-color: var(--border); padding: 6px 8px; }
+  .notes { white-space: normal; color: var(--muted); max-width: 420px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Payment Reconciliation</h1>
+  <p class="sub">Live view of <span class="mono">GET /payments</span>. Click a payment to see its linked
+    transactions and its <span class="mono">GET /payments/{id}</span> JSON.</p>
+
+  <section class="cards" id="cards"></section>
+
+  <div class="controls">
+    <input type="search" id="search" placeholder="Search ID, reference, payer, email…" aria-label="Search">
+    <select id="status" aria-label="Status">
+      <option value="">All statuses</option>
+      <option>PENDING</option><option>PARTIALLY_PAID</option>
+      <option>FULLY_PAID</option><option>OVERPAID</option>
+    </select>
+    <select id="pageSize" aria-label="Page size">
+      <option>10</option><option selected>20</option><option>50</option><option>100</option>
+    </select>
+    <button id="refresh">Refresh</button>
+    <label class="muted"><input type="checkbox" id="auto"> Auto-refresh (5s)</label>
+  </div>
+
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Payment</th><th>Reference</th><th>Payer</th><th>Status</th>
+          <th class="num">Expected</th><th class="num">Received</th><th class="num">Outstanding</th>
+          <th class="num">Txns</th>
+        </tr></thead>
+        <tbody id="payments"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span class="muted" id="pageInfo"></span>
+      <button id="prev">‹ Prev</button><button id="next">Next ›</button>
+    </div>
+  </div>
+
+  <h2>Unmatched transactions <span class="muted" id="unmatchedCount"></span></h2>
+  <div class="panel table-wrap">
+    <table>
+      <thead><tr>
+        <th>Transaction</th><th>Reference</th><th>Payer</th><th class="num">Amount</th>
+        <th>Settled</th><th>Reason</th>
+      </tr></thead>
+      <tbody id="unmatched"></tbody>
+    </table>
+  </div>
+
+  <details class="raw">
+    <summary>Raw JSON response</summary>
+    <div class="muted mono" id="rawUrl" style="margin-top:8px"></div>
+    <pre class="mono" id="raw"></pre>
+  </details>
+</main>
+
+<script>
+// All provider data is inserted with textContent (never innerHTML): payer names
+// and references come from webhooks and must not be able to inject markup.
+const $ = (id) => document.getElementById(id);
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "colSpan") node.colSpan = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(c ?? ""));
+  return node;
+}
+const money = (v) => (v == null ? "" : v);
+const amountCell = (v) => el("td", { class: "num mono" + (String(v).startsWith("-") ? " neg" : "") }, money(v));
+const badge = (s) => el("span", { class: `badge ${s}` }, s.replace("_", " "));
+const short = (ts) => (ts ? String(ts).replace("T", " ").slice(0, 19) : "");
+
+let page = 1, lastPages = 1, timer = null;
+let loadSeq = 0;              // only the newest request may render
+const expanded = new Set();   // payment IDs whose detail row is open (survives refreshes)
+
+function url() {
+  const q = new URLSearchParams({ page, page_size: $("pageSize").value });
+  if ($("status").value) q.set("status", $("status").value);
+  if ($("search").value.trim()) q.set("search", $("search").value.trim());
+  return `/payments?${q}`;
+}
+
+async function load() {
+  const u = url();
+  const seq = ++loadSeq;
+  try {
+    const res = await fetch(u);
+    const body = await res.json();
+    if (seq !== loadSeq) return;  // a newer request was sent meanwhile; drop this stale one
+    $("rawUrl").textContent = `GET ${u} → ${res.status}`;
+    $("raw").textContent = JSON.stringify(body, null, 2);
+    if (!res.ok) throw new Error(JSON.stringify(body.detail ?? body));
+    render(body);
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    $("payments").replaceChildren(el("tr", {}, el("td", { colSpan: 8, class: "error" }, `Failed to load: ${e.message}`)));
+  }
+}
+
+function render(data) {
+  const s = data.summary;
+  const cards = [
+    ["Payments", s.total_payments],
+    ...Object.entries(s.payments_by_status).map(([k, v]) => [k.replace("_", " ").toLowerCase(), v]),
+    ["Transactions", `${s.matched_transactions} / ${s.total_transactions} matched`],
+    ...Object.entries(s.totals_by_currency).flatMap(([cur, t]) => [
+      [`${cur} received / expected`, `${t.received} / ${t.expected}`],
+      [`${cur} outstanding`, t.outstanding],
+      [`${cur} unmatched`, t.unmatched_transaction_amount],
+    ]),
+  ];
+  $("cards").replaceChildren(...cards.map(([l, v]) =>
+    el("div", { class: "panel card" }, el("div", { class: "label" }, l), el("div", { class: "value" }, String(v)))));
+
+  const rows = [];
+  for (const p of data.payments) {
+    const row = el("tr", { class: "row", tabindex: "0" },
+      el("td", { class: "mono" }, p.payment_id),
+      el("td", { class: "mono" }, p.reference ?? ""),
+      el("td", {}, p.payer_name ?? ""),
+      el("td", {}, badge(p.status)),
+      amountCell(p.expected_amount), amountCell(p.received_amount), amountCell(p.outstanding_amount),
+      el("td", { class: "num" }, String(p.transactions.length)),
+    );
+    const toggle = () => toggleDetail(row, p);
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (e) => { if (e.key === "Enter") toggle(); });
+    rows.push(row);
+  }
+  if (!rows.length) rows.push(el("tr", {}, el("td", { colSpan: 8, class: "muted" }, "No payments match these filters.")));
+  $("payments").replaceChildren(...rows);
+  // Re-open the detail rows that were open before this refresh.
+  data.payments.forEach((p, i) => { if (expanded.has(p.payment_id)) showDetail(rows[i], p); });
+
+  const pg = data.pagination;
+  lastPages = Math.max(pg.total_pages, 1);
+  $("pageInfo").textContent = `Page ${pg.page} of ${lastPages} · ${pg.total_items} payments`;
+  $("prev").disabled = pg.page <= 1;
+  $("next").disabled = pg.page >= lastPages;
+
+  $("unmatchedCount").textContent = `(${data.unmatched_transactions.length})`;
+  const un = data.unmatched_transactions.map((t) => el("tr", {},
+    el("td", { class: "mono" }, t.transaction_id),
+    el("td", { class: "mono" }, t.reference ?? ""),
+    el("td", {}, t.payer_name ?? ""),
+    amountCell(t.amount),
+    el("td", { class: "mono" }, short(t.settled_at)),
+    el("td", { class: "notes" }, t.reason ?? ""),
+  ));
+  if (!un.length) un.push(el("tr", {}, el("td", { colSpan: 6, class: "muted" }, "None.")));
+  $("unmatched").replaceChildren(...un);
+}
+
+function toggleDetail(row, p) {
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains("detail")) {
+    next.remove();
+    expanded.delete(p.payment_id);
+    return;
+  }
+  expanded.add(p.payment_id);
+  showDetail(row, p);
+}
+
+async function showDetail(row, p) {
+  const cell = el("td", { colSpan: 8 }, "Loading…");
+  row.after(el("tr", { class: "detail" }, cell));
+
+  let res, one;
+  try {
+    res = await fetch(`/payments/${encodeURIComponent(p.payment_id)}`);
+    one = await res.json();
+    if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(one.detail ?? one)}`);
+  } catch (e) {
+    cell.replaceChildren(el("div", { class: "error" }, `Failed to load ${p.payment_id}: ${e.message}`));
+    return;
+  }
+  const txns = one.transactions ?? [];
+  const table = txns.length
+    ? el("table", { class: "inner" },
+        el("thead", {}, el("tr", {},
+          el("th", {}, "Transaction"), el("th", {}, "Match type"), el("th", { class: "num" }, "Allocated"),
+          el("th", { class: "num" }, "Txn amount"), el("th", {}, "Reference"), el("th", {}, "Payer"),
+          el("th", {}, "Settled"), el("th", {}, "Notes"))),
+        el("tbody", {}, ...txns.map((t) => el("tr", {},
+          el("td", { class: "mono" }, t.transaction_id),
+          el("td", { class: "mono" }, t.match_type),
+          amountCell(t.allocated_amount), amountCell(t.transaction_amount),
+          el("td", { class: "mono" }, t.reference ?? ""),
+          el("td", {}, t.payer_name ?? ""),
+          el("td", { class: "mono" }, short(t.settled_at)),
+          el("td", { class: "notes" }, t.match_notes ?? "")))))
+    : el("div", { class: "muted" }, "No linked transactions.");
+  cell.replaceChildren(
+    table,
+    el("div", { class: "muted mono", style: "margin-top:10px" }, `GET /payments/${p.payment_id} → ${res.status}`),
+    el("pre", { class: "mono" }, JSON.stringify(one, null, 2)),
+  );
+}
+
+let searchDebounce;
+$("search").addEventListener("input", () => { clearTimeout(searchDebounce); searchDebounce = setTimeout(() => { page = 1; load(); }, 250); });
+$("status").addEventListener("change", () => { page = 1; load(); });
+$("pageSize").addEventListener("change", () => { page = 1; load(); });
+$("refresh").addEventListener("click", load);
+$("prev").addEventListener("click", () => { if (page > 1) { page--; load(); } });
+$("next").addEventListener("click", () => { if (page < lastPages) { page++; load(); } });
+$("auto").addEventListener("change", (e) => {
+  clearInterval(timer);
+  if (e.target.checked) timer = setInterval(load, 5000);
+});
+load();
+</script>
+</body>
+</html>
