@@ -142,11 +142,13 @@ references (`INV REF-2026-6981`), blank and `UNKNOWN-*` references, partial and 
 short payments, and payer-name variants. Each matching tier handles a case found there.
 
 ### 2. Matching tiers: the most confident rule runs first
+Listed in the order they run (2c is tried before 2b).
+
 | Tier | Rule | Match type |
 |---|---|---|
 | 1 | Reference matches a payment exactly, or appears inside noisy text | `EXACT_REF` / `EXTRACTED_REF` |
 | 1b | Several references: the amount is split across them, filling each balance in order | `MULTI_REF` |
-| 1c | After the grace period: reference is within 1 typo of a payment's (`6918` for `6981`), payer agrees, amount doesn't overpay, exactly one candidate | `FUZZY_REF` |
+| 1c | After the grace period: reference is within 1 typo of an open payment's (`6918` for `6981`), payer agrees, exactly one candidate. A well-formed reference must settle the balance; a malformed one may be partial. If payer + amount points elsewhere, left for review | `FUZZY_REF` |
 | 2 | No usable reference: same payer, amount within fee tolerance, exactly one candidate | `NAME_AMOUNT` / `REFUND_NAME_AMOUNT` |
 | 2c | Same payer, amount exactly equals the combined balance of 2–3 payments, exactly one combination | `MULTI_NAME_AMOUNT` |
 | 2b | No exact payer: name similarity ≥ 0.85 and the **exact** amount, exactly one candidate | `FUZZY_NAME_AMOUNT` |
@@ -177,7 +179,7 @@ several transactions can cover one payment. A payment's `received_amount`, `amou
 | `FULLY_PAID` | Within the fee allowance, up to the amount due (a fully refunded payment owes nothing) |
 | `OVERPAID` | More than the amount due |
 
-The fee allowance (default 2%) only applies below the expected amount, because fees reduce
+The fee allowance (default 2%) only applies below the amount due, because fees reduce
 what arrives. Refunds are negative links. A refund first gives back any overpayment, and the
 rest lowers `amount_due` (the payer owes less), so a refund never reopens a balance
 (DESIGN.md Q1).
@@ -209,11 +211,11 @@ reproducible, auditable and fast.
 DESIGN.md §9 describes an **AI analysis agent** (designed, not built). It is read-only and
 advisory. It analyses the **raw events** as the provider sent them, not only the
 reconciliation results, so it can spot new data shapes the rules don't handle yet. It can:
-- **Suggests matches for exceptions**, such as a short payment from a misspelled company
+- **Suggest matches for exceptions**, such as a short payment from a misspelled company
   name, with a confidence score and its reasoning. A person approves each one.
-- **Investigates breaks**, for example "this $40 gap matches the processor's chargeback fee
+- **Investigate breaks**, for example "this $40 gap matches the processor's chargeback fee
   on the 12th", so analysts don't have to dig for the context.
-- **Proposes new rules:** when the agent keeps solving the same kind of exception, that
+- **Propose new rules:** when the agent keeps solving the same kind of exception, that
   solution becomes a deterministic rule. The AI does discovery, and the rules engine does
   enforcement.
 

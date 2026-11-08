@@ -2,9 +2,11 @@
 
 Working design document for the Payment Reconciliation Service. It records what is
 built, what is planned, and — explicitly — which parts rest on assumptions rather than
-on the assignment README or observed data.
+on the assignment brief ([`ASSIGNMENT.md`](ASSIGNMENT.md)) or observed data.
 
-**Status legend:** ✅ built & tested · 🟡 planned · ❓ open question
+**Start here.** Most of the design is in §4 (what the provider actually sent) and §5 (how
+matching works, and why). §6–7 list the assumptions and open questions. §1–3 cover goals,
+layout and infrastructure decisions; §8–9 cover future work and the proposed AI analysis agent.
 
 ---
 
@@ -22,7 +24,7 @@ Guiding principles:
 - **Deterministic, explainable matching.** Every link records *why* it was made.
 - **Pure core, thin edges.** Matching and status logic are pure functions with no I/O,
   so the algorithm can be unit-tested in isolation.
-- **Working first, then improve** (per the README's priority guide).
+- **Working first, then improve** (per the brief's priority guide).
 
 ---
 
@@ -30,30 +32,34 @@ Guiding principles:
 
 ```
 app/
-  main.py                  app wiring, routers, logging              ✅
-  config.py                env settings (+ .env loading)             ✅
-  storage.py               provided JSON file storage                ✅ (provided)
+  main.py                  app wiring, routers, startup + periodic reconciliation
+  config.py                env settings (+ .env loading)
+  storage.py               provided JSON file storage, made atomic and crash-safe
+  static/index.html        browser view of the query API (/ui)
   api/
-    deps.py                injectable dependencies (storage)         ✅
-    webhooks.py            POST /webhooks/{payments,transactions}    ✅
-    payments.py            GET /payments, GET /payments/{id}         ✅
+    deps.py                injectable dependencies (storage)
+    webhooks.py            POST /webhooks/{payments,transactions}
+    payments.py            GET /payments, GET /payments/{id}
   core/
-    signature.py           canonical JSON + HMAC verification        ✅
+    signature.py           canonical JSON + HMAC verification
+    rate_limit.py          per-client token buckets, trusted-proxy client identity
   domain/
-    models.py              inbound event schemas (Decimal amounts)   ✅
-    schemas.py             query API response schemas                ✅
-    status.py              pure: amounts + tolerance -> status        ✅
+    models.py              inbound event schemas (Decimal amounts)
+    schemas.py             query API response schemas (+ OpenAPI examples)
+    status.py              pure: amounts + tolerance -> status
   services/
-    ingest.py              idempotent persistence of events          ✅
-    queries.py             read-side views for the query API         ✅
+    ingest.py              idempotent persistence of events, raw event log
+    queries.py             read-side views for the query API
   reconciliation/
-    normalize.py           reference / payer-name normalization      ✅
-    matcher.py             pure: transaction + candidates -> links   ✅
-    engine.py              orchestration, re-scan, writes links      ✅
-tests/                                                               ✅ (signature, webhooks, storage, normalize, status, matcher, engine, query API)
+    normalize.py           reference / payer-name normalization, reference typo distance
+    matcher.py             pure: transaction + candidates -> links
+    engine.py              orchestration: repeat passes, atomic link writes
+scripts/simulate.py        seeded data generator and replay tool
+tests/                     one module per component, plus fixtures: observed events,
+                           hand-written edge cases, generated datasets
 ```
 
-### Webhook request flow ✅
+### Webhook request flow
 
 ```
 request
@@ -76,7 +82,7 @@ request
 
 ## 3. Decisions made
 
-### Signature verification ✅
+### Signature verification
 - Signature is computed over **canonical JSON** of the *parsed* body (keys sorted,
   `separators=(",", ":")`, `sandbox_id` removed) — never the raw bytes. Tests send
   pretty-printed bodies to prove this.
@@ -87,7 +93,7 @@ request
   signature (e.g. `txn_6b40e8cbf37606b8`) and never redelivers it validly — a deliberate
   forgery test. Rejecting it with `401` is the correct outcome; no change was needed.
 
-### Idempotency ✅
+### Idempotency
 - Key = the provider's own ID (`payment_id` / `transaction_id`). **Observed:** duplicate
   deliveries are identical except for `timestamp` (e.g. `pay_a7c17401fb7c6557`), so their
   bytes and signatures differ — deduplicating on a hash of the body or the signature would
@@ -97,7 +103,7 @@ request
 - A duplicate with **different data** keeps the original and logs a warning — silently
   overwriting a financial record is worse than flagging it.
 
-### Atomic persistence ✅
+### Atomic persistence
 - **Crash-safe saves.** The provided `_save()` opened the file with `"w"` (truncating it)
   before writing; a crash mid-write left invalid JSON, which `_load()` discards — losing
   all data. Saves now write a temp file, `fsync`, then `os.replace()` it over the original,
@@ -111,7 +117,7 @@ request
 - **Defence in depth.** The engine treats any transaction that already has a link as matched
   regardless of its flag, repairs the flag, and never links it twice.
 
-### Rate limiting ✅
+### Rate limiting
 `app/core/rate_limit.py`, in-memory token bucket per client.
 
 - **Scope:** `GET /payments` and `GET /payments/{id}` share one bucket per client
@@ -137,13 +143,13 @@ request
   first, so random keys can't grow memory without bound.
 - **Limits:** single process only.
 
-### Money handling ✅
+### Money handling
 - Amounts arrive as strings and are parsed to `Decimal`; floats are never used.
 - Amounts are persisted as strings to keep the JSON file lossless.
 
-### Raw event log ✅
+### Raw event log
 - Every verified delivery, duplicates included, is appended to `data/raw_events.jsonl`
-  (git-ignored) with its outcome (`accepted` / `duplicate`) and receipt time. The README says to derive the matching logic "based on the data you
+  (git-ignored) with its outcome (`accepted` / `duplicate`) and receipt time. The brief says to derive the matching logic "based on the data you
   receive", so we capture real data before tuning the matcher.
 
 ### AI for analysis, deterministic rules for linking money
@@ -214,7 +220,7 @@ derived from this, not from guesses.
 
 ---
 
-## 5. Reconciliation design ✅
+## 5. Reconciliation design
 
 ### Data model
 - **Reconciliation links are the single source of truth** for what matched what.
@@ -229,15 +235,57 @@ derived from this, not from guesses.
 Derived from §4. Evaluated in order; stop at the first tier that yields an
 **unambiguous** result. Currency must always match.
 
-| Tier | Rule | `match_type` |
-|---|---|---|
-| 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for identifier-like known payment references as whole tokens (must contain a digit and be at least 4 characters, so `PAYMENT` never matches ordinary words; all-digit references like `10423` count), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
-| 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last. If a well-formed reference in the text has no payment yet, wait out the grace period first; after it, allocate across the payments that exist **only if the amount fits their remaining balances** (otherwise leave unmatched for review, so the missing payment's share isn't lost to a permanent link) | `MULTI_REF` (not yet observed) |
-| 1c | A reference matching no payment, once its grace period has passed: within `FUZZY_REFERENCE_MAX_EDITS` (default 1) typos of a payment's reference, where an adjacent swap (`6981` → `6918`) counts as one (optimal string alignment distance, `rapidfuzz`); references of 8+ characters with a digit only. Same currency, payer name equal or similar (as tier 2b), amount no more than the remaining balance (refund: reverses an earlier linked amount); **only if exactly one candidate**, otherwise fall through to tier 2 | `FUZZY_REF` |
-| 2 | No usable ref — empty or placeholder (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its grace period has passed: same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
-| 2c | Exact payer, no single payment fits, positive amount: amount **exactly** equals the combined remaining balances of 2–3 of that payer's open payments (`PENDING`/`PARTIALLY_PAID` by status, so a fee shortfall on a `FULLY_PAID` payment is never treated as a balance), and **exactly one** such combination. Balances not smaller than the amount are pruned first; searched only when ≤ 30 candidates remain, and stops at the second combination found | `MULTI_NAME_AMOUNT` |
-| 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount not yet refunded); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
-| 3 | Nothing confident → leave unmatched, surfaced in the unmatched list | — |
+Listed in the order they run (2c is tried before 2b). Details for each tier follow the table.
+
+| Tier | When | Rule | `match_type` |
+|---|---|---|---|
+| 1 | Reference equals a payment's, or a known one is found in noisy text | Link to that payment | `EXACT_REF` / `EXTRACTED_REF` |
+| 1b | Several references found | Split across them, filling each balance in order | `MULTI_REF` |
+| 1c | Reference matches no payment, after the grace period | Within N typos of exactly one open payment's reference; payer agrees; amount fits | `FUZZY_REF` |
+| 2 | No usable reference | Same payer + amount within fee tolerance; exactly one candidate | `NAME_AMOUNT` / `REFUND_NAME_AMOUNT` |
+| 2c | Same payer, but no single payment fits | Amount **exactly** equals 2–3 open balances; exactly one combination | `MULTI_NAME_AMOUNT` |
+| 2b | No same-payer candidate at all | Similar name + **exact** amount; exactly one candidate | `FUZZY_NAME_AMOUNT` |
+| 3 | Nothing confident | Leave unmatched, with the reason | — |
+
+**Tier details**
+- **1. Reference, any format.** The normalized (trimmed, uppercased) reference **equals** a
+  payment's → link the full amount. Otherwise, search the text for known payment references
+  as whole tokens (at least 4 characters and containing a digit, so `PAYMENT` never matches
+  ordinary words; all-digit references like `10423` count), plus any well-formed
+  `(REF|ORD|PAY|INV)-YYYY-NNNN`. `EXTRACTED_REF` means it was found inside noisy text.
+- **1b. Several references** (not yet observed). Allocate across them, filling each
+  remaining balance in order; the remainder goes to the last. If a well-formed reference in
+  the text has no payment yet, wait out the grace period first. After it, allocate across
+  the payments that exist **only if the amount fits their remaining balances**; otherwise
+  leave it for review, so the missing payment's share isn't lost to a permanent link.
+- **1c. Reference typo.** Runs only once the grace period has passed. The reference must be
+  within `FUZZY_REFERENCE_MAX_EDITS` (default 1) typos of a payment's reference, where an
+  adjacent swap (`6981` → `6918`) counts as one (optimal string alignment distance,
+  `rapidfuzz`); only references of 8+ characters with a digit are compared. Same currency;
+  payer name equal or similar (as in tier 2b); payment still open (not settled, including
+  within the fee tolerance). Amount: a well-formed reference must settle the remaining
+  balance within tolerance, since it may be a different invoice whose payment is missing; a
+  malformed one may be a partial payment (no more than the remaining balance); a refund must
+  reverse an earlier linked amount. **Only if exactly one candidate.** If payer + amount
+  (tier 2) points at a *different* payment, leave it for review; otherwise fall through to
+  tier 2.
+- **2. Payer + amount.** Applies when there's no usable reference: empty or a placeholder
+  (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its
+  grace period has passed. Same currency + normalized payer name (casefold, strip
+  `inc`/`llc`/`co`/`corp`) + amount equal to the remaining balance or expected amount
+  within tolerance. **Only if exactly one candidate.**
+- **2c. Combined balances.** Exact payer, no single payment fits, positive amount. The amount
+  must **exactly** equal the combined remaining balances of 2–3 of that payer's open
+  payments (`PENDING`/`PARTIALLY_PAID` by status, so a fee shortfall on a `FULLY_PAID`
+  payment is never treated as a balance), with **exactly one** such combination. Balances
+  not smaller than the amount are pruned first; the search runs only when ≤ 30 candidates
+  remain, and stops at the second combination found.
+- **2b. Similar payer name.** Only if tier 2 found **no** same-payer candidate. Name
+  similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names,
+  plus an amount **exactly** equal to the remaining balance (refund: exactly reverses an
+  earlier linked amount not yet refunded). **Only if exactly one candidate.**
+
+**Why the tiers work this way**
 
 - **References are format-agnostic.** An earlier version only recognised the observed
   `REF/ORD/PAY/INV-YYYY-NNNN` shape and treated anything else as "no reference" — so
@@ -288,6 +336,10 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
   also separates *different* invoices (`REF-2026-6981` vs `REF-2026-6982` is 1 edit, the
   same as a real typo). So it waits out the grace period (the exact payment may still
   arrive), and needs the payer to agree, the amount to fit, and a unique candidate.
+  A well-formed near-miss must also settle the balance in full: a partial amount under
+  `...-6982` is too weak to move money for good to `...-6981`, when `...-6982`'s own
+  payment may simply be missing. When the typo and payer + amount point at different
+  payments, neither wins; the transaction waits for review.
   Edit distance is used instead of a similarity ratio because a ratio scores a typo and
   a neighbouring invoice number almost the same.
   Separator variants of well-formed references (spaces, `_`, `.`, `/`) are normalized to dashes.
@@ -384,7 +436,7 @@ All 27 transactions in §4: 24 linked (21 `EXACT_REF`, 1 `EXTRACTED_REF`, 2 `NAM
 3 `UNKNOWN-*` left unmatched with a reason. Payments: 18 `FULLY_PAID` (incl. REF-2026-1047
 at −1.5%), 2 `PARTIALLY_PAID` (REF-2026-8710, REF-2026-9857, outside the 2% tolerance).
 
-### Query API ✅
+### Query API
 
 | Endpoint | Returns |
 |---|---|
@@ -410,18 +462,18 @@ at −1.5%), 2 `PARTIALLY_PAID` (REF-2026-8710, REF-2026-9857, outside the 2% to
 
 ## 6. Assumptions
 
-Things the implementation relies on that the README does **not** state. Each should be
+Things the implementation relies on that the brief does **not** state. Each should be
 confirmed or revised against real data.
 
 | # | Assumption | Basis | How to verify |
 |---|---|---|---|
 | A1 | Provider IDs (`payment_id`, `transaction_id`) are stable across redeliveries and safe as idempotency keys | ✅ **Confirmed:** redeliveries reuse the ID with identical business fields; only `timestamp` changes, so content/signature-based dedupe would fail | — |
-| A2 | Non-ASCII characters may be signed either escaped (`\uXXXX`) or raw UTF-8; we accept both | README doesn't specify `ensure_ascii`; no non-ASCII payloads observed yet | Check which form validates on a real non-ASCII payload, then narrow |
+| A2 | Non-ASCII characters may be signed either escaped (`\uXXXX`) or raw UTF-8; we accept both | The brief doesn't specify `ensure_ascii`; no non-ASCII payloads observed yet | Check which form validates on a real non-ASCII payload, then narrow |
 | A3 | Events with an unexpected `event_type` should be acknowledged (200) and ignored, not rejected | Avoids pointless retries; none observed yet | Watch logs for any such events |
 | A4 | Ordering between the two streams is **not** guaranteed (a transaction may arrive before its payment) | Observed so far: payments batch first, so not yet seen; kept as a cheap safeguard | Compare arrival order of linked pairs in raw log |
 | A5 | Amounts are always sent as JSON strings, never numbers | ✅ **Confirmed** across all observed events | — |
 | A6 | A transaction only matches payments in the same currency | Matching across currencies would need FX data we don't have | Check for cross-currency near-matches |
-| A7 | Fees only *reduce* the received amount (so tolerance is applied below the expected amount) | README: "fee deductions" | Inspect under-payments clustered just below expected |
+| A7 | Fees only *reduce* the received amount (so tolerance is applied below the expected amount) | Brief: "fee deductions" | Inspect under-payments clustered just below expected |
 | A8 | A wrong match is worse than a missed one | Financial-data norm | Design choice — no verification needed |
 
 ---
