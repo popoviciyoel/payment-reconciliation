@@ -11,6 +11,7 @@ ENV/
 
 # Data
 data/*.json
+data/*.jsonl
 
 # IDE
 .idea/

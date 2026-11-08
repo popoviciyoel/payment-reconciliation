@@ -7,6 +7,11 @@ This file is PROVIDED - loads configuration from environment variables.
 import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
+# Load .env before Settings reads os.environ (real env vars take precedence).
+load_dotenv()
+
 
 @dataclass
 class Settings:
