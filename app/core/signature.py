@@ -19,6 +19,7 @@ from typing import Any
 from fastapi import HTTPException, Request, status
 
 from app.config import settings
+from app.core.rate_limit import record_invalid_signature
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ async def verified_payload(request: Request) -> dict[str, Any]:
     header = request.headers.get(SIGNATURE_HEADER)
     if not verify_signature(payload, header, secret):
         logger.warning("Rejected webhook with invalid signature on %s", request.url.path)
+        # Only failed attempts are counted, so valid provider traffic is never limited.
+        record_invalid_signature(request)
         if settings.debug:
             _log_rejected(request.url.path, raw_body, header, payload, secret)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature")

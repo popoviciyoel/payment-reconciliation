@@ -44,6 +44,15 @@ class Settings:
     # new events arrive. 0 disables the timer.
     reconcile_interval_seconds: float = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
 
+    # Rate limiting (per client; 0 disables). Query endpoints: sustained rate + burst.
+    rate_limit_per_minute: float = float(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+    rate_limit_burst: int = int(os.getenv("RATE_LIMIT_BURST", "20"))
+    # Failed webhook signature attempts per client per minute (valid ones are never limited).
+    invalid_signature_limit_per_minute: float = float(os.getenv("INVALID_SIGNATURE_LIMIT_PER_MINUTE", "10"))
+    # Comma-separated addresses of reverse proxies whose X-Forwarded-For is trusted
+    # (e.g. "127.0.0.1,::1" for a local ngrok agent). Empty: never trust the header.
+    trusted_proxies: str = os.getenv("TRUSTED_PROXIES", "")
+
 
 # Singleton settings instance
 settings = Settings()

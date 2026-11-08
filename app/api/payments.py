@@ -3,12 +3,18 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.deps import get_storage
+from app.core.rate_limit import limit_queries
 from app.domain.schemas import Payment, PaymentList
 from app.domain.status import PaymentStatus
 from app.services import queries
 from app.storage import JsonStorage
 
-router = APIRouter(prefix="/payments", tags=["payments"])
+router = APIRouter(
+    prefix="/payments",
+    tags=["payments"],
+    dependencies=[Depends(limit_queries)],
+    responses={429: {"description": "Rate limit exceeded; see the Retry-After header"}},
+)
 
 
 @router.get("", response_model=PaymentList)

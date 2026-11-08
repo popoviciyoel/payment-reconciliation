@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_storage
 from app.config import settings
 from app.core import signature
+from app.core.rate_limit import reset_limiters
 from app.core.signature import compute_signature
 from app.main import app
 from app.services import ingest
@@ -64,3 +65,11 @@ def transaction_payload():
         "timestamp": "2024-01-16T14:30:00Z",
         "sandbox_id": "sandbox_xyz",
     }
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limits():
+    """Rate-limit buckets are process-wide; isolate each test."""
+    reset_limiters()
+    yield
+    reset_limiters()
