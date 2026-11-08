@@ -18,6 +18,10 @@ Tiers, tried in order; the first that yields an unambiguous answer wins
        - reference but no payment has it            -> wait out a grace period (the
          payment may not have arrived yet), then fall through to tier 2, since
          references aren't always informative; link notes record the fallback
+  1c. Reference matching no payment, after the grace period: within
+       `reference_max_edits` typos of exactly one payment's reference, with the
+       payer agreeing and the amount fitting                -> FUZZY_REF
+       Otherwise fall through to tier 2.
   2. No usable reference (empty, placeholder, or matching no payment):
        - payment: same normalized payer + amount within tolerance of the
                   remaining balance                                -> NAME_AMOUNT
@@ -43,7 +47,7 @@ from itertools import combinations
 from decimal import Decimal
 from enum import Enum
 
-from app.domain.status import PaymentStatus, Tolerance, compute_status
+from app.domain.status import PaymentStatus, Tolerance, compute_status, settle
 from app.reconciliation.normalize import (
     find_references,
     is_placeholder_reference,
@@ -51,6 +55,7 @@ from app.reconciliation.normalize import (
     normalize_name,
     normalize_reference,
     numbers_agree,
+    reference_distance,
 )
 
 DEFAULT_NAME_SIMILARITY_THRESHOLD = 0.85
@@ -59,6 +64,9 @@ DEFAULT_NAME_SIMILARITY_THRESHOLD = 0.85
 # open payments per payer we'll search combinations of (C(30, 3) = 4060).
 MAX_PAYMENTS_PER_TRANSACTION = 3
 MAX_OPEN_PAYMENTS_FOR_COMBINATIONS = 30
+
+# Tier 1c: typos (edits, adjacent swaps) allowed between a reference and a payment's.
+DEFAULT_REFERENCE_MAX_EDITS = 1
 
 
 def unreversed(amounts) -> tuple[Decimal, ...]:
@@ -82,6 +90,7 @@ class MatchType(str, Enum):
     REFUND_NAME_AMOUNT = "REFUND_NAME_AMOUNT"
     FUZZY_NAME_AMOUNT = "FUZZY_NAME_AMOUNT"
     MULTI_NAME_AMOUNT = "MULTI_NAME_AMOUNT"
+    FUZZY_REF = "FUZZY_REF"
 
 
 @dataclass(frozen=True)
@@ -118,8 +127,13 @@ class PaymentView:
         return amount in self.unreversed_amounts and amount <= self.received
 
     @property
+    def amount_due(self) -> Decimal:
+        """Expected, less refunds that reduced what is owed (see `settle`)."""
+        return settle(self.expected, self.linked_amounts).amount_due
+
+    @property
     def remaining(self) -> Decimal:
-        return self.expected - self.received
+        return self.amount_due - self.received
 
 
 @dataclass(frozen=True)
@@ -149,6 +163,7 @@ def match(
     payments: list[PaymentView],
     tolerance: Tolerance,
     name_threshold: float = DEFAULT_NAME_SIMILARITY_THRESHOLD,
+    reference_max_edits: int = DEFAULT_REFERENCE_MAX_EDITS,
 ) -> MatchResult:
     if txn.amount == 0:
         return _unmatched("zero amount")
@@ -166,6 +181,9 @@ def match(
     context = f"reference {txn.reference.strip()!r} matched no payment"
     if not txn.reference_fallback_allowed:
         return _unmatched(f"{context} yet; waiting for it before matching on payer + amount")
+    typo = _match_by_reference_typo(txn, ref, payments, tolerance, name_threshold, reference_max_edits)
+    if typo is not None:
+        return typo
     fallback = _match_by_name_and_amount(txn, payments, tolerance, name_threshold)
     if fallback.matched:
         return MatchResult(tuple(
@@ -245,6 +263,61 @@ def _match_by_reference(
         note = f"reference {', '.join(missing)} matched no payment after the grace period"
         result = MatchResult(tuple(replace(a, notes=f"{a.notes}; {note}") for a in result.allocations))
     return result
+
+
+def _match_by_reference_typo(
+    txn: TransactionView,
+    ref: str,
+    payments: list[PaymentView],
+    tolerance: Tolerance,
+    name_threshold: float,
+    max_edits: int,
+) -> MatchResult | None:
+    """
+    Tier 1c: a reference a few typos away from one payment's. Runs only after the
+    grace period (the caller checks), so a reference to a payment that simply
+    hasn't arrived isn't redirected to its near-identical neighbour. One digit
+    also separates *different* invoices (`...-6981` vs `...-6982`), so the
+    distance alone never decides: the payer must agree, the amount must fit, and
+    exactly one payment may qualify. None means fall through to payer + amount.
+    """
+    if max_edits <= 0:
+        return None
+    # Compare the well-formed reference inside noisy text, or the whole text.
+    targets = find_references(ref, ()) or [ref]
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+
+    fits = []
+    for p in payments:
+        p_ref = normalize_reference(p.reference)
+        distance = reference_distance(target, p_ref) if p_ref else None
+        if distance is None or distance > max_edits or p.currency != txn.currency:
+            continue
+        same_payer = normalize_name(txn.payer_name) == normalize_name(p.payer_name) != ""
+        if not same_payer and not (
+            numbers_agree(txn.payer_name, p.payer_name)
+            and name_similarity(txn.payer_name, p.payer_name) >= name_threshold
+        ):
+            continue
+        amount_fits = (
+            0 < txn.amount <= p.remaining if txn.amount > 0 else p.can_refund(-txn.amount)
+        )
+        if amount_fits:
+            fits.append((p, distance))
+
+    if len(fits) != 1:
+        return None
+    p, distance = fits[0]
+    return MatchResult((Allocation(
+        payment_id=p.payment_id,
+        amount=txn.amount,
+        match_type=MatchType.FUZZY_REF,
+        notes=(f"reference {target!r} is {distance} typo(s) from {p.reference!r} (max {max_edits}); "
+               f"payer name similarity {name_similarity(txn.payer_name, p.payer_name)}; "
+               f"amount fits {'the remaining balance' if txn.amount > 0 else 'an earlier payment'}"),
+    ),))
 
 
 def _ref_notes(txn: TransactionView, p: PaymentView, exact: bool) -> str:
@@ -337,7 +410,7 @@ def _match_combined_balances(
     open_payments = sorted(
         (
             p for p in same_payer
-            if compute_status(p.expected, p.received, tolerance) in _OPEN_STATUSES
+            if compute_status(p.amount_due, p.received, tolerance) in _OPEN_STATUSES
             and 0 < p.remaining < txn.amount
         ),
         key=lambda p: p.payment_id,

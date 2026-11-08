@@ -47,7 +47,7 @@ def test_list_payments_shape_and_summary(client, seeded):
     assert (s["total_transactions"], s["matched_transactions"], s["unmatched_transactions"]) == (7, 5, 2)
     # Never summed across currencies.
     assert s["totals_by_currency"]["USD"] == {
-        "expected": "1425.00", "received": "1225.00",
+        "expected": "1425.00", "amount_due": "1425.00", "received": "1225.00",
         "outstanding": "195.00",                      # 120 (p_part) + 75 (p_none); p_fee counts as settled
         "unmatched_transaction_amount": "52.00",
     }
@@ -156,3 +156,15 @@ def test_multi_payment_split_shows_allocated_vs_full_amount(client, store):
     reconcile(store, Tolerance(percent=D("2")))
     link = client.get("/payments/b").json()["transactions"][0]
     assert (link["allocated_amount"], link["transaction_amount"], link["match_type"]) == ("50.00", "150.00", "MULTI_REF")
+
+
+def test_refund_reduces_amount_due_instead_of_reopening_balance(client, store):
+    # Observed: PAY-2026-3316 was paid in full, then 522.01 was refunded (DESIGN Q1).
+    add_payment(store, "p_ref", "PAY-2026-3316", "2327.15", "Apex Trading Co")
+    add_txn(store, "t_pay", "PAY-2026-3316", "2327.15", "Apex Trading Co", settled="2026-11-08T10:00:00")
+    add_txn(store, "t_refund", "PAY-2026-3316", "-522.01", "Apex Trading Co", settled="2026-11-08T10:01:00")
+    reconcile(store, Tolerance(percent=D("2")))
+    p = client.get("/payments").json()["payments"][0]
+    assert (p["status"], p["expected_amount"], p["amount_due"], p["received_amount"], p["outstanding_amount"]) == (
+        "FULLY_PAID", "2327.15", "1805.14", "1805.14", "0.00"
+    )

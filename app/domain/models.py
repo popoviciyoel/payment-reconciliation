@@ -21,6 +21,20 @@ class _Event(BaseModel):
 
 
 class PaymentCreated(_Event):
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "event_type": "payment.created",
+        "payment_id": "pay_abc123",
+        "reference": "INV-2024-1234",
+        "expected_amount": "1000.00",
+        "currency": "USD",
+        "payer_name": "Acme Corporation",
+        "payer_email": "billing@acme.com",
+        "due_date": "2024-01-20",
+        "description": "Invoice payment",
+        "timestamp": "2024-01-15T10:00:00Z",
+        "sandbox_id": "sandbox_xyz",
+    }]})
+
     payment_id: str
     reference: str | None = None
     expected_amount: Decimal
@@ -36,6 +50,20 @@ class PaymentCreated(_Event):
 
 
 class TransactionSettled(_Event):
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "event_type": "transaction.settled",
+        "transaction_id": "txn_xyz789",
+        "reference": "INV-2024-1234",
+        "amount": "400.00",
+        "currency": "USD",
+        "payer_name": "ACME CORP",
+        "payer_account_last_four": "4242",
+        "settled_at": "2024-01-16T14:30:00Z",
+        "bank_reference": "BANK-ABC123",
+        "timestamp": "2024-01-16T14:30:00Z",
+        "sandbox_id": "sandbox_xyz",
+    }]})
+
     transaction_id: str
     reference: str | None = None  # may be missing
     amount: Decimal  # negative for refunds

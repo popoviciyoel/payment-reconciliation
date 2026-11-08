@@ -24,7 +24,7 @@ from app.api.deps import get_storage
 from app.config import settings
 from app.core import signature
 from app.core.signature import compute_signature
-from app.domain.status import Tolerance, compute_status
+from app.domain.status import Tolerance, compute_status, settle
 from app.main import app
 from app.reconciliation.engine import reconcile
 from app.services import ingest
@@ -110,7 +110,9 @@ def assert_invariants(store: JsonStorage) -> None:
         received = sum((D(l["amount"]) for l in by_payment.get(pid, [])), D("0"))
         assert D(p.get("received_amount") or "0") == received, f"{pid} projection drifted"
         if by_payment.get(pid):
-            assert p["status"] == compute_status(D(p["expected_amount"]), received, TOL).value, pid
+            s = settle(D(p["expected_amount"]), [D(l["amount"]) for l in by_payment[pid]])
+            assert D(p["amount_due"]) == s.amount_due, f"{pid} amount due drifted"
+            assert p["status"] == compute_status(s.amount_due, s.received, TOL).value, pid
 
 
 # --------------------------------------------------------------------------- observed data
@@ -290,12 +292,7 @@ def test_generated_datasets_never_mismatch(store, seed, payments_first):
     assert outcome["noise_unmatched"] == sum(1 for t in ds.transactions if not t["truth"])
 
 
-FIXED_POINT_GAP = pytest.mark.xfail(strict=True, reason=(
-    "a no-reference transaction that was ambiguous earlier in a run is not re-checked after a later "
-    "match in the same run removes the ambiguity (see edge case ambiguity_resolved_later_in_same_run)"))
-
-
-@pytest.mark.parametrize("seed", [pytest.param(s, marks=FIXED_POINT_GAP) if s == 12 else s for s in range(25)])
+@pytest.mark.parametrize("seed", range(25))
 def test_reconcile_reaches_a_fixed_point(store, seed):
     """After the last delivery, another run should find nothing new to match."""
     ds = generate(seed=seed, n_payments=40, payments_first=True)

@@ -2,7 +2,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from app.domain.status import PaymentStatus as S, Tolerance, compute_status
+from app.domain.status import PaymentStatus as S, Tolerance, compute_status, settle
 
 TOL_2PCT = Tolerance(percent=D("2"))
 
@@ -42,3 +42,21 @@ def test_tolerance_covers():
     assert TOL_2PCT.covers(D("100"), D("100"))
     assert not TOL_2PCT.covers(D("100.01"), D("100"))
     assert not TOL_2PCT.covers(D("97.99"), D("100"))
+
+
+# A refund first gives back any overpayment; the rest reduces the amount due (DESIGN Q1).
+@pytest.mark.parametrize("amounts, due, received, status", [
+    ([], "100.00", "0", S.PENDING),
+    (["100.00", "-30.00"], "70.00", "70.00", S.FULLY_PAID),       # partial refund: settled, not reopened
+    (["120.00", "-20.00"], "100.00", "100.00", S.FULLY_PAID),     # refund of the overpayment (Q3)
+    (["150.00", "-60.00"], "90.00", "90.00", S.FULLY_PAID),       # 50 overpayment back, 10 off the due
+    (["50.00", "-10.00"], "90.00", "40.00", S.PARTIALLY_PAID),    # still owes 50, as before the refund
+    (["100.00", "-100.00"], "0.00", "0.00", S.FULLY_PAID),        # fully refunded: nothing owed
+    (["-30.00"], "70.00", "-30.00", S.PENDING),                   # refund linked before its payment
+    (["-30.00", "100.00"], "70.00", "70.00", S.FULLY_PAID),       # ...then the payment arrives
+    (["100.00", "-30.00", "40.00"], "70.00", "110.00", S.OVERPAID),  # paid again after a credit
+])
+def test_settle_applies_refunds(amounts, due, received, status):
+    s = settle(D("100.00"), [D(a) for a in amounts])
+    assert (s.amount_due, s.received) == (D(due), D(received))
+    assert compute_status(s.amount_due, s.received, Tolerance()) is status

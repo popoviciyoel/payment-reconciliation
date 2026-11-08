@@ -106,3 +106,16 @@ def test_generic_known_reference_is_not_searched_inside_text(generic):
 @pytest.mark.parametrize("ref", ["ABC123", "A1B2", "104233", "10423", "1234"])
 def test_identifier_like_known_reference_is_searched_inside_text(ref):
     assert find_references(f"PAID {ref} THANKS", [ref]) == [ref]
+
+
+def test_reference_distance_counts_adjacent_swap_as_one_typo():
+    from app.reconciliation.normalize import reference_distance
+    assert reference_distance("REF-2026-6981", "REF-2026-6918") == 1
+    assert reference_distance("REF-2026-6981", "REF-2026-6981") == 0
+    assert reference_distance("REF-2026-6981", "REF-2026-1896") > 1
+
+
+def test_reference_distance_ignores_short_or_digitless_references():
+    from app.reconciliation.normalize import reference_distance
+    assert reference_distance("A12", "A13") is None
+    assert reference_distance("INVOICES", "INVOICED") is None

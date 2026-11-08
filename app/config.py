@@ -36,6 +36,10 @@ class Settings:
     # Minimum payer-name similarity (0..1) for the fuzzy name + exact amount tier.
     fuzzy_name_threshold: float = float(os.getenv("FUZZY_NAME_THRESHOLD", "0.85"))
 
+    # Typos (edits, adjacent swaps) allowed between a transaction reference and a
+    # payment's once no payment has it exactly. 0 disables fuzzy reference matching.
+    fuzzy_reference_max_edits: int = int(os.getenv("FUZZY_REFERENCE_MAX_EDITS", "1"))
+
     # A transaction whose reference matches no payment waits this long (from when we
     # received it) for that payment to arrive before falling back to payer + amount.
     reference_grace_minutes: float = float(os.getenv("REFERENCE_GRACE_MINUTES", "15"))

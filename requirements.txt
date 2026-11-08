@@ -4,6 +4,7 @@ uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 httpx>=0.26.0
 python-dotenv>=1.0.0
+rapidfuzz>=3.0.0
 
 # Testing (if you choose to add tests)
 pytest>=7.4.0

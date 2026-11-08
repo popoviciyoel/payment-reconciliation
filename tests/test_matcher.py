@@ -486,3 +486,66 @@ def test_balances_larger_than_the_amount_are_pruned_before_searching():
     payments += [pay("s1", "S-1", "40.00", "Acme"), pay("s2", "S-2", "60.00", "Acme")]
     r = match(txn(None, "100.00", "Acme"), payments, TOL)
     assert {a.payment_id for a in r.allocations} == {"s1", "s2"}
+
+
+# ----------------------------------------------------------------- tier 1c: reference typos
+
+def test_typo_in_reference_matches_when_payer_and_amount_agree():
+    # REF-2026-6981 with the last two digits swapped.
+    a = only(match(txn("REF-2026-6918", "4670.75", "Quantum Dynamics"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_6981", M.FUZZY_REF)
+    assert "1 typo(s)" in a.notes
+
+
+def test_typo_inside_noisy_text_matches():
+    a = only(match(txn("INV REF-2026-6918", "2000.00", "Quantum Dynamics"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type, a.amount) == ("p_6981", M.FUZZY_REF, D("2000.00"))
+
+
+def test_typo_allows_partial_payment_but_not_overpayment():
+    assert only(match(txn("REF-2026-6918", "100.00", "Quantum Dynamics"), PAYMENTS, TOL)).payment_id == "p_6981"
+    r = match(txn("REF-2026-6918", "9000.00", "Quantum Dynamics"), PAYMENTS, TOL)
+    assert not r.matched
+
+
+def test_near_reference_of_another_payer_never_matches():
+    # One digit from Quantum's REF-2026-6981, but paid by someone else: likely a different invoice.
+    r = match(txn("REF-2026-6982", "4670.75", "Stellar Group"), PAYMENTS, TOL)
+    assert not r.matched
+
+
+def test_typo_waits_out_the_grace_period():
+    # The payment REF-2026-6918 may simply not have arrived yet.
+    t = TransactionView("txn_1", "REF-2026-6918", D("4670.75"), "USD", "Quantum Dynamics",
+                        reference_fallback_allowed=False)
+    r = match(t, PAYMENTS, TOL)
+    assert not r.matched and "waiting" in r.reason
+
+
+def test_typo_ambiguous_between_two_payments_is_not_fuzzy_matched():
+    payments = [
+        pay("p_a", "REF-2026-1000", "500.00", "Acme"),
+        pay("p_b", "REF-2026-1002", "500.00", "Acme"),
+    ]
+    # One edit from both, same payer, amount fits both.
+    r = match(txn("REF-2026-1001", "500.00", "Acme"), payments, TOL)
+    assert not r.matched
+
+
+def test_typo_matching_respects_max_edits_setting():
+    # Disabled: falls back to payer + amount instead.
+    t = txn("REF-2026-6918", "4670.75", "Quantum Dynamics")
+    assert only(match(t, PAYMENTS, TOL, reference_max_edits=0)).match_type == M.NAME_AMOUNT
+    two_edits = txn("REF-2026-6900", "4670.75", "Quantum Dynamics")
+    assert all(a.match_type != M.FUZZY_REF for a in match(two_edits, PAYMENTS, TOL).allocations)
+    assert only(match(two_edits, PAYMENTS, TOL, reference_max_edits=2)).match_type == M.FUZZY_REF
+
+
+def test_typo_needs_currency_match():
+    r = match(txn("REF-2026-6918", "4670.75", "Quantum Dynamics", currency="EUR"), PAYMENTS, TOL)
+    assert not r.matched
+
+
+def test_refund_with_typo_reverses_earlier_payment():
+    a = only(match(txn("REF-2026-2468", "-53.80", "Prime Logistics"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_2486", M.FUZZY_REF)

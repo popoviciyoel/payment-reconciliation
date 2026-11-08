@@ -22,7 +22,7 @@ from decimal import Decimal
 from threading import Lock
 
 from app.config import settings
-from app.domain.status import Tolerance, compute_status
+from app.domain.status import Tolerance, compute_status, settle
 from app.reconciliation.matcher import PaymentView, TransactionView, match
 from app.storage import JsonStorage
 
@@ -99,9 +99,11 @@ def _transaction_view(t: dict, now: datetime, grace: timedelta, started_at: date
 
 
 def _projection(view: PaymentView, tolerance: Tolerance) -> dict:
+    s = settle(view.expected, view.linked_amounts)
     return {
-        "received_amount": str(view.received),
-        "status": compute_status(view.expected, view.received, tolerance).value,
+        "received_amount": str(s.received),
+        "amount_due": str(s.amount_due),
+        "status": compute_status(s.amount_due, s.received, tolerance).value,
     }
 
 
@@ -145,65 +147,77 @@ def reconcile(
     with _reconcile_lock:
         payments = _payment_views(storage)
         linked_txn_ids = {l["transaction_id"] for l in storage.get_all_reconciliation_links()}
-        unmatched = sorted(
-            storage.get_unmatched_transactions(),
-            key=lambda t: (t.get("settled_at") or "", t["transaction_id"]),
-        )
-
         matched = links_created = 0
-        for t in unmatched:
-            if t["transaction_id"] in linked_txn_ids:
-                # Already linked but flag not set (e.g. data written before writes
-                # were atomic): never link twice; just repair the flag.
-                _refresh_payments(storage, _repair_flag(storage, t["transaction_id"]), tolerance)
-                continue
+        evaluated: int | None = None
+        while True:
+            unmatched = sorted(
+                storage.get_unmatched_transactions(),
+                key=lambda t: (t.get("settled_at") or "", t["transaction_id"]),
+            )
+            if evaluated is None:
+                evaluated = len(unmatched)
+            matched_before = matched
 
-            result = match(_transaction_view(t, now, grace, started_at), list(payments.values()), tolerance, settings.fuzzy_name_threshold)
+            for t in unmatched:
+                if t["transaction_id"] in linked_txn_ids:
+                    # Already linked but flag not set (e.g. data written before writes
+                    # were atomic): never link twice; just repair the flag.
+                    _refresh_payments(storage, _repair_flag(storage, t["transaction_id"]), tolerance)
+                    continue
 
-            if not result.matched:
-                if t.get("unmatched_reason") != result.reason:
-                    storage.update_transaction(t["transaction_id"], {"unmatched_reason": result.reason})
-                    logger.info("Transaction %s unmatched: %s", t["transaction_id"], result.reason)
-                continue
+                result = match(_transaction_view(t, now, grace, started_at), list(payments.values()), tolerance, settings.fuzzy_name_threshold, settings.fuzzy_reference_max_edits)
 
-            # Compute the post-match views first, then persist everything at once.
-            updated = dict(payments)
-            for a in result.allocations:
-                p = updated[a.payment_id]
-                updated[a.payment_id] = replace(
-                    p,
-                    received=p.received + a.amount,
-                    linked_amounts=p.linked_amounts + (a.amount,),
+                if not result.matched:
+                    if t.get("unmatched_reason") != result.reason:
+                        storage.update_transaction(t["transaction_id"], {"unmatched_reason": result.reason})
+                        logger.info("Transaction %s unmatched: %s", t["transaction_id"], result.reason)
+                    continue
+
+                # Compute the post-match views first, then persist everything at once.
+                updated = dict(payments)
+                for a in result.allocations:
+                    p = updated[a.payment_id]
+                    updated[a.payment_id] = replace(
+                        p,
+                        received=p.received + a.amount,
+                        linked_amounts=p.linked_amounts + (a.amount,),
+                    )
+                payment_ids = list(dict.fromkeys(a.payment_id for a in result.allocations))
+                storage.record_match(
+                    t["transaction_id"],
+                    links=[{
+                        "payment_id": a.payment_id,
+                        "match_type": a.match_type.value,
+                        "amount": str(a.amount),
+                        "notes": a.notes,
+                    } for a in result.allocations],
+                    transaction_updates={
+                        "matched": True,
+                        "matched_to_payment_id": payment_ids[0],
+                        "matched_payment_ids": payment_ids,
+                        "unmatched_reason": None,
+                    },
+                    payment_updates={pid: _projection(updated[pid], tolerance) for pid in payment_ids},
                 )
-            payment_ids = list(dict.fromkeys(a.payment_id for a in result.allocations))
-            storage.record_match(
-                t["transaction_id"],
-                links=[{
-                    "payment_id": a.payment_id,
-                    "match_type": a.match_type.value,
-                    "amount": str(a.amount),
-                    "notes": a.notes,
-                } for a in result.allocations],
-                transaction_updates={
-                    "matched": True,
-                    "matched_to_payment_id": payment_ids[0],
-                    "matched_payment_ids": payment_ids,
-                    "unmatched_reason": None,
-                },
-                payment_updates={pid: _projection(updated[pid], tolerance) for pid in payment_ids},
-            )
-            # Only advance in-memory state once the write succeeded, so later
-            # transactions in this run see these allocations.
-            payments = updated
-            linked_txn_ids.add(t["transaction_id"])
-            links_created += len(result.allocations)
-            matched += 1
-            logger.info(
-                "Matched transaction %s -> %s (%s)",
-                t["transaction_id"], ", ".join(payment_ids), result.allocations[0].match_type.value,
-            )
+                # Only advance in-memory state once the write succeeded, so later
+                # transactions in this run see these allocations.
+                payments = updated
+                linked_txn_ids.add(t["transaction_id"])
+                links_created += len(result.allocations)
+                matched += 1
+                logger.info(
+                    "Matched transaction %s -> %s (%s)",
+                    t["transaction_id"], ", ".join(payment_ids), result.allocations[0].match_type.value,
+                )
 
-        return ReconcileReport(evaluated=len(unmatched), matched=matched, links_created=links_created)
+            # A match can settle what an earlier-settled transaction was waiting on
+            # (another candidate's balance filled, so its ambiguity is gone). Repeat
+            # until a pass links nothing, so the outcome doesn't depend on where run
+            # boundaries fall. Each repeat links at least one more transaction, so it ends.
+            if matched == matched_before:
+                break
+
+        return ReconcileReport(evaluated=evaluated or 0, matched=matched, links_created=links_created)
 
 
 def refresh_all(storage: JsonStorage, tolerance: Tolerance | None = None) -> None:

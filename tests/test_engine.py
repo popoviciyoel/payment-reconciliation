@@ -245,7 +245,8 @@ def test_duplicate_refund_reverses_a_payment_only_once(store):
     assert store.get_transaction("r1")["matched_payment_ids"] == ["p1"]
     assert not store.get_transaction("r2")["matched"]
     p = store.get_payment("p1")
-    assert D(p["received_amount"]) == 0 and p["status"] == "PENDING"
+    # Fully refunded: nothing is owed any more (DESIGN Q1).
+    assert (D(p["received_amount"]), D(p["amount_due"]), p["status"]) == (0, 0, "FULLY_PAID")
     # Same answer on a later run, when the views are rebuilt from stored links.
     reconcile(store, TOL)
     assert not store.get_transaction("r2")["matched"]
@@ -277,3 +278,31 @@ def test_refund_outcome_does_not_depend_on_run_boundaries(store, split_runs):
     add_txn(store, "r2", None, "-100.00", settled="2026-11-08T14:00:00")
     reconcile(store, TOL)
     assert not store.get_transaction("r2")["matched"]
+
+
+
+def test_refund_linked_before_its_payment_settles_once_paid(store):
+    # Observed: PAY-2026-3316's refund was linked ~8 minutes before the payment it reverses.
+    add_payment(store, "p1", "PAY-2026-3316", "2327.15")
+    add_txn(store, "r1", "PAY-2026-3316", "-522.01", settled="2026-11-08T10:00:00")
+    reconcile(store, TOL)
+    p = store.get_payment("p1")
+    assert (p["status"], p["amount_due"], p["received_amount"]) == ("PENDING", "1805.14", "-522.01")
+    add_txn(store, "t1", "PAY-2026-3316", "2327.15", settled="2026-11-08T10:05:00")
+    reconcile(store, TOL)
+    p = store.get_payment("p1")
+    assert (p["status"], p["amount_due"], p["received_amount"]) == ("FULLY_PAID", "1805.14", "1805.14")
+
+
+def test_later_match_resolves_earlier_ambiguity_in_one_run(store):
+    # t1 (no reference) fits both payments, so it's ambiguous when checked first.
+    # t2 settles later and pays p2 by reference; that leaves p1 as t1's only fit,
+    # and the same run must pick that up instead of waiting for the next webhook.
+    add_payment(store, "p1", "ORD-2026-0701", "500.00")
+    add_payment(store, "p2", "ORD-2026-0702", "500.00")
+    add_txn(store, "t1", "", "500.00", settled="2026-11-08T09:00:00")
+    add_txn(store, "t2", "ORD-2026-0702", "500.00", settled="2026-11-08T09:05:00")
+    report = reconcile(store, TOL)
+    assert (report.evaluated, report.matched) == (2, 2)
+    assert store.get_transaction("t1")["matched_payment_ids"] == ["p1"]
+    assert reconcile(store, TOL).matched == 0

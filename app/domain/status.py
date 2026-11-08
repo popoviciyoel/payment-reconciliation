@@ -1,8 +1,9 @@
 """
 Payment status derivation (pure).
 
-Status is always computed from the net amount received (sum of reconciliation
-links, refunds included) — never updated incrementally.
+Status is always computed from the reconciliation links (refunds included) —
+never updated incrementally. A refund reduces what the payer owes rather than
+reopening a balance (DESIGN.md Q1).
 """
 
 from dataclasses import dataclass
@@ -37,11 +38,40 @@ class Tolerance:
         return target - self.allowance(target) <= amount <= target
 
 
-def compute_status(expected: Decimal, received: Decimal, tolerance: Tolerance) -> PaymentStatus:
+@dataclass(frozen=True)
+class Settlement:
+    amount_due: Decimal  # expected, less refunds that reduced what the payer owes
+    received: Decimal    # net: payments less refunds
+
+
+def settle(expected: Decimal, linked_amounts) -> Settlement:
+    """
+    Apply linked amounts (refunds negative) in link order.
+
+    A refund first gives back any overpayment; the rest reduces the amount due
+    (a credit, discount or cancelled item), so it never reopens a balance:
+      paid 120 of 100, refund 20  -> due 100, received 100 (settled)
+      paid 100 of 100, refund 30  -> due 70,  received 70  (settled)
+      paid 50 of 100,  refund 10  -> due 90,  received 40  (50 still outstanding)
+    """
+    due, received = expected, Decimal("0")
+    for amount in linked_amounts:
+        if amount >= 0:
+            received += amount
+            continue
+        refund = -amount
+        returned_overpayment = min(refund, max(received - due, Decimal("0")))
+        due -= refund - returned_overpayment
+        received -= refund
+    return Settlement(amount_due=due, received=received)
+
+
+def compute_status(amount_due: Decimal, received: Decimal, tolerance: Tolerance) -> PaymentStatus:
+    """Status from net received against the amount due (see `settle`)."""
+    if received > amount_due:
+        return PaymentStatus.OVERPAID
+    if received >= amount_due - tolerance.allowance(amount_due):
+        return PaymentStatus.FULLY_PAID  # also a fully refunded payment: nothing is owed
     if received <= 0:
         return PaymentStatus.PENDING
-    if received > expected:
-        return PaymentStatus.OVERPAID
-    if received >= expected - tolerance.allowance(expected):
-        return PaymentStatus.FULLY_PAID
     return PaymentStatus.PARTIALLY_PAID

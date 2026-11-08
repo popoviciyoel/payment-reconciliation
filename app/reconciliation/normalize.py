@@ -10,6 +10,8 @@ Derived from observed provider data (DESIGN.md §4):
 import re
 from difflib import SequenceMatcher
 
+from rapidfuzz.distance import OSA
+
 REFERENCE_PATTERN = re.compile(r"\b(?:REF|ORD|PAY|INV)-\d{4}-\d{4}\b")
 # The same reference written with other separators (`PAY 2026 9788`, `INV_2026_1234`,
 # `REF - 2026 - 0001`). At least one separator between parts, so `PAY20269788` and
@@ -99,6 +101,22 @@ def find_references(normalized_text: str, known_references) -> list[str]:
         if (standalone := [sp for sp in ref_spans if not nested(ref, sp)])
     }
     return sorted(positions, key=positions.__getitem__)
+
+
+# Shortest reference we will compare by edit distance: one edit on a short
+# reference ("A12" -> "A13") is too large a share of it to call a typo.
+MIN_FUZZY_REFERENCE_LENGTH = 8
+
+
+def reference_distance(a: str, b: str) -> int | None:
+    """
+    Typos between two normalized references, counting a swap of adjacent
+    characters (`6981` -> `6918`) as one edit, like a misinput keystroke. None if
+    either is too short or has no digit to compare this way.
+    """
+    if not all(searchable_inside_text(r) and len(r) >= MIN_FUZZY_REFERENCE_LENGTH for r in (a, b)):
+        return None
+    return OSA.distance(a, b)
 
 
 def normalize_name(raw: str | None) -> str:

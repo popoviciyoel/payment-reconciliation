@@ -169,9 +169,14 @@ def generate(seed: int = 42, n_payments: int = 60, n_noise: int = 8, duplicate_r
             txn(ref, -_money(rng, 1, float(expected) / 2), name, [pid])
 
     # Noise: money that belongs to nothing we know about.
+    # Keep clear of every balance a payer could have open at *any* point - the full
+    # amount, and what remains after any subset of its transactions has landed
+    # (deliveries are shuffled, so installments/refunds land in any order).
     payer_amounts: dict[str, list[Decimal]] = {}
     for p in ds.payments:
-        payer_amounts.setdefault(p["payer_name"], []).append(Decimal(p["expected_amount"]))
+        paid = [Decimal(t["amount"]) for t in ds.transactions if p["payment_id"] in t["truth"]]
+        balances = {Decimal(p["expected_amount"]) - sum(c) for c in _subsets(paid)}
+        payer_amounts.setdefault(p["payer_name"], []).extend(b for b in balances if b > 0)
     for _ in range(n_noise):
         payer, variants = rng.choice(PAYERS)
         while True:  # keep clear of any amount the payer could plausibly owe
@@ -198,6 +203,13 @@ def generate(seed: int = 42, n_payments: int = 60, n_noise: int = 8, duplicate_r
             events.insert(rng.randint(events.index(e) + 1, len(events)), dup)
     ds.deliveries = events
     return ds
+
+
+def _subsets(items: list) -> list[list]:
+    out = [[]]
+    for x in items:
+        out += [s + [x] for s in out]
+    return out
 
 
 def _strip(record: dict) -> dict:

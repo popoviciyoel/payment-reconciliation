@@ -35,7 +35,13 @@ def _outstanding(record: dict) -> Decimal:
     """Balance still due. Zero once settled: a within-tolerance shortfall is treated as fees."""
     if (record.get("status") or PaymentStatus.PENDING.value) in _SETTLED:
         return ZERO
-    return max(_dec(record.get("expected_amount")) - _dec(record.get("received_amount")), ZERO)
+    return max(_amount_due(record) - _dec(record.get("received_amount")), ZERO)
+
+
+def _amount_due(record: dict) -> Decimal:
+    """Expected less refunds that reduced what is owed; expected until first reconciled."""
+    due = record.get("amount_due")
+    return _dec(due) if due not in (None, "") else _dec(record.get("expected_amount"))
 
 
 def _matches_search(term: str, *fields) -> bool:
@@ -68,6 +74,7 @@ def _to_payment(record: dict, links: list[dict], transactions: dict[str, dict]) 
         reference=record.get("reference"),
         status=record.get("status") or PaymentStatus.PENDING,
         expected_amount=expected,
+        amount_due=_amount_due(record),
         received_amount=received,
         outstanding_amount=_outstanding(record),
         currency=record.get("currency") or "USD",
@@ -91,12 +98,16 @@ def _links_by_payment(storage: JsonStorage) -> dict[str, list[dict]]:
 def _summary(payments: list[dict], transactions: list[dict], linked_txn_ids: set[str]) -> Summary:
     by_status = Counter(p.get("status") or PaymentStatus.PENDING.value for p in payments)
     totals: dict[str, dict[str, Decimal]] = defaultdict(
-        lambda: {"expected": ZERO, "received": ZERO, "outstanding": ZERO, "unmatched_transaction_amount": ZERO}
+        lambda: {
+            "expected": ZERO, "amount_due": ZERO, "received": ZERO, "outstanding": ZERO,
+            "unmatched_transaction_amount": ZERO,
+        }
     )
     for p in payments:
         t = totals[p.get("currency") or "USD"]
         expected, received = _dec(p.get("expected_amount")), _dec(p.get("received_amount"))
         t["expected"] += expected
+        t["amount_due"] += _amount_due(p)
         t["received"] += received
         t["outstanding"] += _outstanding(p)
 
