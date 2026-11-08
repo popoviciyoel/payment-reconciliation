@@ -136,8 +136,8 @@ request
 - Amounts are persisted as strings to keep the JSON file lossless.
 
 ### Raw event log ✅
-- Every newly accepted, verified payload is appended to `data/raw_events.jsonl`
-  (git-ignored). The README says to derive the matching logic "based on the data you
+- Every verified delivery, duplicates included, is appended to `data/raw_events.jsonl`
+  (git-ignored) with its outcome (`accepted` / `duplicate`) and receipt time. The README says to derive the matching logic "based on the data you
   receive", so we capture real data before tuning the matcher.
 
 ### AI for analysis, deterministic rules for linking money
@@ -187,7 +187,8 @@ derived from this, not from guesses.
   reference had the shape `(REF|ORD|PAY|INV)-YYYY-NNNN`, and finding the reference inside
   noisy text fixes both noisy cases. The matcher does **not** depend on that shape
   (§5) — it's one sample, and other providers or test data will differ. No typo'd
-  references were observed, so edit-distance matching is not needed yet. Other separators
+  references were observed, but the brief asks for fuzzy reference matching, so tier 1c
+  allows a configurable number of typos under strict conditions (§5). Other separators
   are not typos: `PAY 2026 9788`, `INV_2026_1234` and `REF - 2026 - 0001` are rewritten
   to the dash form during normalization, so they match exactly.
 - **Payer name alone must never decide a match.** Most payers have several open payments.
@@ -236,6 +237,7 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
 |---|---|---|
 | 1 | Any format. Normalized (trim/uppercase) reference **equals** a payment's → link full amount. Otherwise search the text for identifier-like known payment references as whole tokens (must contain a digit and be at least 4 characters, so `PAYMENT` never matches ordinary words; all-digit references like `10423` count), plus well-formed `(REF\|ORD\|PAY\|INV)-YYYY-NNNN` | `EXACT_REF` / `EXTRACTED_REF` (if found inside noisy text) |
 | 1b | Several references found → allocate across them, filling each remaining balance in order; remainder to the last. If a well-formed reference in the text has no payment yet, wait out the grace period first; after it, allocate across the payments that exist **only if the amount fits their remaining balances** (otherwise leave unmatched for review, so the missing payment's share isn't lost to a permanent link) | `MULTI_REF` (not yet observed) |
+| 1c | A reference matching no payment, once its grace period has passed: within `FUZZY_REFERENCE_MAX_EDITS` (default 1) typos of a payment's reference, where an adjacent swap (`6981` → `6918`) counts as one (optimal string alignment distance, `rapidfuzz`); references of 8+ characters with a digit only. Same currency, payer name equal or similar (as tier 2b), amount no more than the remaining balance (refund: reverses an earlier linked amount); **only if exactly one candidate**, otherwise fall through to tier 2 | `FUZZY_REF` |
 | 2 | No usable ref — empty or placeholder (`UNKNOWN-*`, `N/A`, `NONE`, `NULL`, `-`), or a reference matching no payment once its grace period has passed: same currency + normalized payer name (casefold, strip `inc`/`llc`/`co`/`corp`) + amount equals remaining balance or expected amount within tolerance; **only if exactly one candidate** | `NAME_AMOUNT` |
 | 2c | Exact payer, no single payment fits, positive amount: amount **exactly** equals the combined remaining balances of 2–3 of that payer's open payments (`PENDING`/`PARTIALLY_PAID` by status, so a fee shortfall on a `FULLY_PAID` payment is never treated as a balance), and **exactly one** such combination. Balances not smaller than the amount are pruned first; searched only when ≤ 30 candidates remain, and stops at the second combination found | `MULTI_NAME_AMOUNT` |
 | 2b | Only if tier 2 found **no** same-payer candidate: payer name similarity ≥ `FUZZY_NAME_THRESHOLD` (default 0.85) **and** the same numbers in both names, plus amount **exactly** equal to the remaining balance (refund: exactly reverses an earlier linked amount not yet refunded); **only if exactly one candidate** | `FUZZY_NAME_AMOUNT` |
@@ -286,17 +288,24 @@ Derived from §4. Evaluated in order; stop at the first tier that yields an
   by a number (`Payer 1` vs `Payer 2`, 0.86) are excluded by the numbers guard. Tier 2b
   never runs when an exact-name payer exists, so it can't redirect money to a
   different but similar payer.
-- Fuzzy (edit-distance) *reference* matching is deferred until the data shows typos.
+- Fuzzy *reference* matching (tier 1c) never relies on the distance alone: one digit
+  also separates *different* invoices (`REF-2026-6981` vs `REF-2026-6982` is 1 edit, the
+  same as a real typo). So it waits out the grace period (the exact payment may still
+  arrive), and needs the payer to agree, the amount to fit, and a unique candidate.
+  Edit distance is used instead of a similarity ratio because a ratio scores a typo and
+  a neighbouring invoice number almost the same.
   Separator variants of well-formed references (spaces, `_`, `.`, `/`) are normalized to dashes.
 - Links are immutable once made, so results are reproducible and explainable.
 
 ### Status
 | Status | Rule |
 |---|---|
-| `PENDING` | no linked amount |
-| `PARTIALLY_PAID` | 0 < received < expected − tolerance |
-| `FULLY_PAID` | received within tolerance of expected |
-| `OVERPAID` | received > expected (+ tolerance) |
+| `PENDING` | nothing received (net ≤ 0) and something still due |
+| `PARTIALLY_PAID` | 0 < received < amount due − tolerance |
+| `FULLY_PAID` | received within tolerance of the amount due (including fully refunded: nothing due) |
+| `OVERPAID` | received > amount due |
+
+`amount due` is expected less refunds that reduced what is owed (§5 Refunds).
 
 Fee tolerance is configurable via `FEE_TOLERANCE_PERCENT` / `FEE_TOLERANCE_FIXED`
 (allowance = the larger of the two). Default: **2%** — under-calling "fully paid" is the safer error. The three
@@ -331,11 +340,20 @@ The scale-out path is in §8.
 
 ### Refunds
 Negative transactions attach to the payment they reverse (same matching tiers) and
-reduce its received amount.
+reduce its received amount. They also reduce what the payer owes (Q1): applied in link
+order, a refund first gives back any overpayment and the rest lowers `amount_due`.
+So a refund never reopens a balance, and a fully refunded payment is `FULLY_PAID` with
+nothing due (`settle` in `app/domain/status.py`). A refund larger than what was paid
+leaves a negative amount due and needs review.
 
 ### Late arrivals
 When a new payment arrives, previously unmatched transactions are re-evaluated against
 it. Cheap to do and harmless if it never triggers.
+
+Within a run, transactions are checked in settlement order, and a later match can resolve
+an earlier transaction's ambiguity (it fills the other candidate's balance). So a run
+repeats its pass until a pass links nothing. The result then doesn't depend on how events
+were grouped into runs, and running again right after finds nothing new.
 
 ### Execution
 Matching runs as a FastAPI background task after the 200, serialized behind one lock so
@@ -418,10 +436,10 @@ Questions we would ask the assignment authors; current handling noted for each.
 
 | # | Question | Current handling |
 |---|---|---|
-| Q1 | The README uses two provider hosts (Lightsail URL vs `mock-api.advancehq.com`). Which is canonical? | Registration and webhook subscription both worked on the Lightsail host; using that via `MOCK_PROVIDER_URL` |
-| Q2 | What fee tolerance is expected — percentage, fixed, or both? Typical magnitude? Are the −1.5% to −4.8% short payments fees or partials? | Both configurable, default 2%; watching for follow-up transactions (§4) |
+| Q1 | When a refund is linked to a payment, does the payer owe the refunded amount again, or has the amount due gone down (credit, discount, cancelled item)? | **Assumed:** the amount due goes down. A refund first gives back any overpayment (Q3), and the rest reduces `amount_due`, so it never reopens a balance. PAY-2026-3316 (paid 2327.15, refunded 522.01) is `FULLY_PAID` with 1805.14 due and received. A returned or charged-back payment would look the same in the data (Q12). |
+| Q2 | Are short payments of about 1.5–5% bank fees (the payment is settled) or partial payments (the rest is still due)? | Treated as fees up to 2% (`FEE_TOLERANCE_PERCENT`): REF-2026-1047 (−1.5%) is `FULLY_PAID`; REF-2026-8710 (−4.4%) and REF-2026-9857 (−4.8%) stay `PARTIALLY_PAID`. A later transaction for exactly 39.01, 61.65 or 138.91 would show they were partials (§5). A written-off shortfall leaves outstanding, so expected − received ≠ outstanding in the totals. |
 | Q3 | For a payment that's `OVERPAID` and later receives a refund, should status move back (e.g. to `FULLY_PAID`)? | Yes — status is derived from current net received amount |
-| Q4 | Run reconciliation inline in the webhook request, or as a background task after the 200? | **Decided:** background task, serialized by a lock |
+| Q4 | How soon after a transaction webhook must the payment's status be correct? Is it acceptable for the API to briefly show the old status? | Matching runs in the background after the 200, one run at a time, so status lags a webhook by one run. Matching inside the webhook request would remove the lag but slow every webhook response. |
 | Q5 | Derive payment status at read time vs store it and recompute on change? | **Decided:** recomputed from links on every change and at startup; cached on the record |
 | Q6 | Should a refund with no identifiable original payment be surfaced separately from other unmatched transactions? | Plan: shown in unmatched list with its negative amount |
 | Q7 | Can a single transaction partly match one payment and leave a remainder unallocated? | No — every matched transaction is fully allocated; a multi-reference remainder goes to the last referenced payment (may make it `OVERPAID`) |
@@ -429,6 +447,7 @@ Questions we would ask the assignment authors; current handling noted for each.
 | Q9 | When a fallback (payer + amount) link turns out wrong because the referenced payment arrives *after* the grace period, should the link be **moved** to it automatically? | Open. Not implemented: links are immutable. Option: mark fallback links provisional and, when a payment arrives whose reference exactly equals the transaction's, move the link atomically and recalculate both payments (the first payment's status may regress). |
 | Q10 | What grace period suits the provider? | 15 minutes by default, configurable. Observed payments arrived before their transactions, so the wait rarely matters live; shuffled simulations show it's what prevents wrong matches. |
 | Q11 | Does the real provider keep `payer_account_last_four` stable per payer? | Not in observed data (a new value on every transaction), so unused. If stable: remember accounts seen on reference-matched transactions per payer, and use a known account as *corroboration* — e.g. let the fuzzy-name tier accept an amount within the fee tolerance instead of an exact amount. Never sufficient on its own (only four digits). |
+| Q12 | How can we tell a refund (money sent back to the payer, who now owes less) from a returned payment or chargeback (the payment failed, so the payer still owes it)? Is there a field, transaction type or reference pattern that distinguishes them? | Not distinguished: both arrive as a negative amount, and every negative amount is treated as a refund (Q1). A chargeback would wrongly show the payment as settled. If the provider marks them, a returned payment should reduce `received` only, leaving `amount_due` unchanged, so the balance reopens. |
 
 ---
 
@@ -461,6 +480,17 @@ Questions we would ask the assignment authors; current handling noted for each.
 An AI agent alongside the deterministic engine, for the work that needs judgement rather
 than rules. It reads; it never writes links.
 
+It analyses two sources, not just the engine's output:
+- **Raw events:** every verified payload as the provider sent it (`data/raw_events.jsonl`),
+  including fields the matcher ignores, and, when enabled, rejected deliveries
+  (`data/rejected_events.jsonl`). This is where new data shapes first appear, before any
+  rule exists for them, and it is how this project's rules were found (§4).
+- **Reconciliation results:** payments, links with their match types, and unmatched
+  reasons. These show what the rules did with that data.
+
+Reading raw events is what lets the agent find what the rules miss. Reading only the
+results would limit it to the cases the rules already know about.
+
 ### Why an agent
 - **Unstructured data.** Real references are free text (`INV REF-2026-6981`,
   `November invoice x2`), payer names drift (`apex trading co`, `ACME HLDGS`), and remit
@@ -477,22 +507,36 @@ than rules. It reads; it never writes links.
 ### What it does
 | Capability | Input | Output |
 |---|---|---|
-| **Explain unmatched transactions** | The transaction, the matcher's recorded reason, open payments of plausible payers | A plain-language diagnosis, e.g. "free-text reference from Apex; amount equals ORD-2026-2811 + PAY-2026-5038" |
-| **Suggest matches** | Same | Candidate payment(s) with allocation, confidence and reasoning — stored as a *suggestion* for review |
-| **Detect patterns and propose rules** | The raw event log, links and unmatched reasons over time | Proposed rule or setting changes with evidence: new reference formats, payer aliases, a fee percentage (answers Q2), stable account numbers (answers Q11), a better grace period (Q10) |
-| **Reconciliation report** | Summary statistics and the above | A narrative report: match rate, unmatched amount, anomalies, trends |
+| **Explain unmatched transactions** | The raw transaction payload, the matcher's recorded reason, raw payloads of plausible payers' open payments | A plain-language diagnosis, e.g. "free-text reference from Apex; amount equals ORD-2026-2811 + PAY-2026-5038" |
+| **Suggest matches** | Same, plus the payer's earlier raw events and links | Candidate payment(s) with allocation, confidence and reasoning — stored as a *suggestion* for review |
+| **Detect patterns and propose rules** | The full raw event log (accepted and rejected), compared with links and unmatched reasons over time | Proposed rule or setting changes with evidence: new reference formats, payer aliases, a fee percentage (answers Q2), stable account numbers (answers Q11), a better grace period (Q10) |
+| **Reconciliation report** | Raw event volumes and delivery behaviour, summary statistics, and the above | A narrative report: match rate, unmatched amount, anomalies, trends |
+
+### Benefits
+- **Suggesting matches for exceptions.** A short payment from a slightly misspelled company
+  name fails tier 2b today, because fuzzy matching requires an exact amount. The agent can
+  propose the likely invoice with a confidence score and its reasoning, and a person
+  approves it.
+- **Investigating and explaining breaks.** The agent gathers the context an analyst would
+  otherwise dig for. For example: "this $40 gap matches the processor's chargeback fee on
+  the 12th." This needs extra inputs, such as processor fee schedules or statements, beyond
+  the two webhook streams.
+- **Proposing new rules.** When the agent keeps solving the same kind of exception, that
+  solution becomes a new deterministic rule with a test. The AI does discovery, and the
+  rules engine does enforcement.
 
 ### How it fits the architecture
 ```
-webhooks ─▶ ingest ─▶ deterministic engine ─▶ links (source of truth) ─▶ query API / UI
-                              ▲                         │
-                     approved rules/settings            │ read-only
-                              │                         ▼
-                        human review ◀──── suggestions ◀── analysis agent
-                                           (separate store)   (on demand / scheduled)
+webhooks ─▶ ingest ─┬─▶ deterministic engine ─▶ links (source of truth) ─▶ query API / UI
+                    │            ▲                         │
+                    ▼   approved rules/settings            │ read-only
+             raw event log       │                         ▼
+                    │       human review ◀── suggestions ◀── analysis agent
+                    │                    (separate store)        ▲
+                    └─────────────────── read-only ──────────────┘
 ```
-- **Advisory only.** The agent has read-only access to events, payments, links and
-  unmatched reasons. Its output goes to a separate suggestions store, never to links.
+- **Advisory only.** The agent has read-only access to the raw event log, payments, links
+  and unmatched reasons. Its output goes to a separate suggestions store, never to links.
 - **Human in the loop.** Approving a suggested match writes a link through the normal
   atomic path with its own match type (e.g. `AGENT_SUGGESTED_APPROVED`), so it is always
   distinguishable and auditable. Rejections are kept, to measure the agent's precision.

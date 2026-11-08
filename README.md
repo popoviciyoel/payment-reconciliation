@@ -61,6 +61,7 @@ Only `WEBHOOK_SECRET` is required. Webhooks are rejected without it.
 |---|---|---|
 | `FEE_TOLERANCE_PERCENT` / `FEE_TOLERANCE_FIXED` | Shortfall still counted as paid (the larger wins) | `2` / `0` |
 | `FUZZY_NAME_THRESHOLD` | Minimum payer-name similarity for fuzzy matching | `0.85` |
+| `FUZZY_REFERENCE_MAX_EDITS` | Typos allowed between a reference and a payment's (0 disables) | `1` |
 | `REFERENCE_GRACE_MINUTES` | How long an unknown reference waits for its payment before falling back to payer + amount | `15` |
 | `RECONCILE_INTERVAL_SECONDS` | Periodic reconciliation (0 disables) | `60` |
 | `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_BURST` | Per-client limit on query endpoints (0 disables) | `60` / `20` |
@@ -74,7 +75,7 @@ Only `WEBHOOK_SECRET` is required. Webhooks are rejected without it.
 pytest                                      # or: docker compose run --rm api pytest
 ```
 
-About 450 tests cover each component, plus end-to-end replays of three fixture sets.
+About 490 tests cover each component, plus end-to-end replays of three fixture sets.
 Known gaps are marked as strict `xfail`, so they start failing once fixed.
 
 | Fixture | Contents |
@@ -92,7 +93,8 @@ WEBHOOK_SECRET=... python -m scripts.simulate replay tests/fixtures/edge_cases.j
 
 ## API
 
-Interactive docs at **http://localhost:8000/docs**. A browser view of the data is at **`/ui`**.
+Interactive docs at **http://localhost:8000/docs**, with example webhook payloads and
+responses. A browser view of the data is at **`/ui`**.
 
 | Method | Path | Description |
 |---|---|---|
@@ -144,6 +146,7 @@ short payments, and payer-name variants. Each matching tier handles a case found
 |---|---|---|
 | 1 | Reference matches a payment exactly, or appears inside noisy text | `EXACT_REF` / `EXTRACTED_REF` |
 | 1b | Several references: the amount is split across them, filling each balance in order | `MULTI_REF` |
+| 1c | After the grace period: reference is within 1 typo of a payment's (`6918` for `6981`), payer agrees, amount doesn't overpay, exactly one candidate | `FUZZY_REF` |
 | 2 | No usable reference: same payer, amount within fee tolerance, exactly one candidate | `NAME_AMOUNT` / `REFUND_NAME_AMOUNT` |
 | 2c | Same payer, amount exactly equals the combined balance of 2–3 payments, exactly one combination | `MULTI_NAME_AMOUNT` |
 | 2b | No exact payer: name similarity ≥ 0.85 and the **exact** amount, exactly one candidate | `FUZZY_NAME_AMOUNT` |
@@ -164,18 +167,20 @@ Money on the wrong invoice is harder to undo than a transaction waiting for revi
 
 ### 4. Links are the single source of truth
 Each link records the amount it allocates, so one transaction can cover several payments and
-several transactions can cover one payment. A payment's `received_amount` and `status` are
+several transactions can cover one payment. A payment's `received_amount`, `amount_due` and `status` are
 **recalculated from its links** rather than incremented, so they can't drift.
 
 | Status | Rule |
 |---|---|
-| `PENDING` | Nothing received, or refunded back to zero |
-| `PARTIALLY_PAID` | Below the expected amount minus the fee allowance |
-| `FULLY_PAID` | Within the fee allowance, up to the expected amount |
-| `OVERPAID` | More than expected |
+| `PENDING` | Nothing received yet |
+| `PARTIALLY_PAID` | Below the amount due minus the fee allowance |
+| `FULLY_PAID` | Within the fee allowance, up to the amount due (a fully refunded payment owes nothing) |
+| `OVERPAID` | More than the amount due |
 
 The fee allowance (default 2%) only applies below the expected amount, because fees reduce
-what arrives. Refunds are negative links, so a status can move back down.
+what arrives. Refunds are negative links. A refund first gives back any overpayment, and the
+rest lowers `amount_due` (the payer owes less), so a refund never reopens a balance
+(DESIGN.md Q1).
 
 ### 5. Webhooks: verify, deduplicate, store, acknowledge, then reconcile
 - **Signatures** are checked over canonical JSON with a constant-time comparison. Without a
@@ -201,9 +206,16 @@ AI analysis of the raw webhook log classified the real cases that shaped the tie
 step that links money stays deterministic, because it runs on every webhook and must be
 reproducible, auditable and fast.
 
-DESIGN.md §9 describes an **AI analysis agent** (designed, not built). It would explain
-unmatched transactions, suggest matches for human approval, detect new patterns to turn into
-rules, and write reconciliation reports. It would be read-only and advisory.
+DESIGN.md §9 describes an **AI analysis agent** (designed, not built). It is read-only and
+advisory. It analyses the **raw events** as the provider sent them, not only the
+reconciliation results, so it can spot new data shapes the rules don't handle yet. It can:
+- **Suggests matches for exceptions**, such as a short payment from a misspelled company
+  name, with a confidence score and its reasoning. A person approves each one.
+- **Investigates breaks**, for example "this $40 gap matches the processor's chargeback fee
+  on the 12th", so analysts don't have to dig for the context.
+- **Proposes new rules:** when the agent keeps solving the same kind of exception, that
+  solution becomes a deterministic rule. The AI does discovery, and the rules engine does
+  enforcement.
 
 ---
 
@@ -218,7 +230,6 @@ rules, and write reconciliation reports. It would be read-only and advisory.
   scheduled audit.
 
 **Matching**
-- Fuzzy reference matching (no typo'd references appeared in the data yet).
 - A review endpoint to confirm, reject or reassign matches, with an audit trail.
 - Build the AI analysis agent.
 - Find out whether the 1.5–4.8% short payments are fees or partial payments (DESIGN.md §7).
@@ -237,6 +248,11 @@ rules, and write reconciliation reports. It would be read-only and advisory.
   several payments. It stays unmatched for review.
 - If a noisy reference names one real invoice and one unknown one, the whole transaction
   waits out the grace period.
+- **A known wrong-match case:** a transaction with no reference that arrives *before* its
+  payment can be linked to another open payment from the same payer, if the amount fits
+  that one within the fee tolerance. Links are permanent, so the right payment never gets
+  it. Preventing this would mean holding every payer + amount match until no new payment
+  could still arrive. It's covered by an expected-failure test case.
 
 ---
 
@@ -266,7 +282,7 @@ generate simulated test data. The architecture and design decisions were mine.
   out-of-order delivery).
 
 **How I validated it**
-- **Tests:** about 450, many built from real provider events, plus simulated replays with
+- **Tests:** about 490, many built from real provider events, plus simulated replays with
   known correct answers.
 - **Live data:** checked every stored event and match. 24 of 27 transactions linked as
   expected, and the three `UNKNOWN-*` transactions were correctly left unmatched.
