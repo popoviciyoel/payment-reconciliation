@@ -2,8 +2,9 @@
 Payment Reconciliation Service
 """
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -28,7 +29,30 @@ async def lifespan(_: FastAPI):
     refresh_all(storage)
     report = reconcile(storage)
     logger.info("Startup reconciliation: %s", report)
+
+    ticker = None
+    if settings.reconcile_interval_seconds > 0:
+        ticker = asyncio.create_task(_periodic_reconcile(settings.reconcile_interval_seconds))
     yield
+    if ticker:
+        ticker.cancel()
+        with suppress(asyncio.CancelledError):
+            await ticker
+
+
+async def _periodic_reconcile(interval: float) -> None:
+    """
+    Re-run reconciliation on a timer so transactions waiting out the reference
+    grace period are re-checked even when no new webhooks arrive.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            report = await asyncio.to_thread(reconcile, storage)
+            if report.matched:
+                logger.info("Periodic reconciliation: %s", report)
+        except Exception:
+            logger.exception("Periodic reconciliation failed; will retry")
 
 
 app = FastAPI(

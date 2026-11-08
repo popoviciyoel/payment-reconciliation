@@ -33,6 +33,17 @@ class Settings:
     fee_tolerance_percent: Decimal = Decimal(os.getenv("FEE_TOLERANCE_PERCENT", "2"))
     fee_tolerance_fixed: Decimal = Decimal(os.getenv("FEE_TOLERANCE_FIXED", "0"))
 
+    # Minimum payer-name similarity (0..1) for the fuzzy name + exact amount tier.
+    fuzzy_name_threshold: float = float(os.getenv("FUZZY_NAME_THRESHOLD", "0.85"))
+
+    # A transaction whose reference matches no payment waits this long (from when we
+    # received it) for that payment to arrive before falling back to payer + amount.
+    reference_grace_minutes: float = float(os.getenv("REFERENCE_GRACE_MINUTES", "15"))
+
+    # Periodic reconciliation, so waiting transactions are re-checked even when no
+    # new events arrive. 0 disables the timer.
+    reconcile_interval_seconds: float = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
+
 
 # Singleton settings instance
 settings = Settings()

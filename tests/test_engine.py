@@ -1,10 +1,12 @@
 """Engine tests against real (temporary) storage, including the webhook -> reconcile path."""
 
+from datetime import datetime, timedelta
 from decimal import Decimal as D
 
 import pytest
 
 from app import storage as storage_module
+from app.config import settings
 from app.domain.status import Tolerance
 from app.reconciliation.engine import reconcile, refresh_all
 from tests.conftest import signed_headers
@@ -137,3 +139,66 @@ def test_linked_but_unflagged_transaction_is_not_linked_twice(store):
     assert t["matched"] is True and t["matched_payment_ids"] == ["p1"]
     p = store.get_payment("p1")
     assert (p["status"], p["received_amount"]) == ("FULLY_PAID", "100.00")
+
+
+def test_non_pattern_reference_end_to_end_via_webhooks(client, store, payment_payload, transaction_payload):
+    payment_payload["reference"] = transaction_payload["reference"] = "ABC123"
+    client.post("/webhooks/payments", json=payment_payload, headers=signed_headers(payment_payload))
+    client.post("/webhooks/transactions", json=transaction_payload, headers=signed_headers(transaction_payload))
+    [link] = store.get_links_for_payment("pay_abc123")
+    assert link["match_type"] == "EXACT_REF"
+    assert store.get_payment("pay_abc123")["status"] == "PARTIALLY_PAID"
+
+
+# ----------------------------------------------------------------- reference grace period
+
+LATER = datetime.now() + timedelta(minutes=16)   # past the default 15-minute grace
+
+
+def test_unmatched_reference_waits_during_grace_period(store):
+    add_payment(store, "p_other", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "INV-2026-0999", "100.00", payer="ACME CORP")   # its payment hasn't arrived
+    reconcile(store, TOL)
+    t = store.get_transaction("t1")
+    assert not t["matched"] and "waiting" in t["unmatched_reason"]
+
+
+def test_referenced_payment_arriving_within_grace_gets_the_money(store):
+    """The scenario the grace period exists for (simulation: txn_sim5_0015)."""
+    add_payment(store, "p_other", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "INV-2026-0999", "100.00", payer="ACME CORP")
+    reconcile(store, TOL)
+    add_payment(store, "p_right", "INV-2026-0999", "100.00", payer="Acme Corporation")
+    reconcile(store, TOL)
+    assert store.get_transaction("t1")["matched_payment_ids"] == ["p_right"]
+    assert store.get_payment("p_other")["status"] == "PENDING"
+
+
+def test_after_grace_period_falls_back_to_payer_and_amount(store):
+    add_payment(store, "p_other", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "November invoice", "100.00", payer="ACME CORP")
+    assert reconcile(store, TOL).matched == 0
+    assert reconcile(store, TOL, now=LATER).matched == 1
+    [link] = store.get_links_for_transaction("t1")
+    assert link["payment_id"] == "p_other" and link["match_type"] == "NAME_AMOUNT"
+    assert "matched no payment" in link["notes"]
+
+
+def test_placeholder_reference_does_not_wait(store):
+    add_payment(store, "p1", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "UNKNOWN-1234ABCD", "100.00", payer="ACME CORP")
+    assert reconcile(store, TOL).matched == 1
+
+
+def test_zero_grace_falls_back_immediately(store, monkeypatch):
+    monkeypatch.setattr(settings, "reference_grace_minutes", 0)
+    add_payment(store, "p1", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    add_txn(store, "t1", "November invoice", "100.00", payer="ACME CORP")
+    assert reconcile(store, TOL).matched == 1
+
+
+def test_grace_is_measured_from_receipt_not_settlement(store):
+    add_payment(store, "p1", "INV-2026-0100", "100.00", payer="Acme Corporation")
+    # Settled long ago, but we only just received it: still waits.
+    add_txn(store, "t1", "November invoice", "100.00", payer="ACME CORP", settled="2020-01-01T00:00:00")
+    assert reconcile(store, TOL).matched == 0

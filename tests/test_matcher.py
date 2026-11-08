@@ -2,6 +2,8 @@
 
 from decimal import Decimal as D
 
+import pytest
+
 from app.domain.status import Tolerance
 from app.reconciliation.matcher import MatchType as M, PaymentView, TransactionView, match
 
@@ -66,12 +68,18 @@ def test_overpayment_by_reference_still_links():
     assert a.payment_id == "p_9137"   # status will become OVERPAID
 
 
-def test_unknown_reference_waits_instead_of_name_matching():
-    # Well-formed ref with no payment yet: must NOT fall back to name+amount,
-    # even though Apex has an open payment of exactly this amount.
-    r = match(txn("INV-2026-8490", "4153.15", "Apex Trading Co"), PAYMENTS, TOL)
+def test_reference_matching_no_payment_falls_back_to_name_and_amount():
+    # References aren't always informative. Known risk (DESIGN.md Q9/Q10): if the
+    # referenced payment arrives later, this link points at the wrong invoice.
+    a = only(match(txn("INV-2026-8490", "4153.15", "Apex Trading Co"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_2811", M.NAME_AMOUNT)
+    assert "'INV-2026-8490' matched no payment" in a.notes
+
+
+def test_reference_matching_no_payment_and_no_fallback_explains_both():
+    r = match(txn("INV-2026-8490", "1.00", "Apex Trading Co"), PAYMENTS, TOL)
     assert not r.matched
-    assert "INV-2026-8490" in r.reason
+    assert "'INV-2026-8490' matched no payment" in r.reason and "fits amount" in r.reason
 
 
 def test_refund_by_reference():
@@ -174,3 +182,151 @@ def test_refund_without_reference_and_no_equal_prior_payment():
 
 def test_zero_amount_is_unmatched():
     assert not match(txn("ORD-2026-4149", "0", "Stellar Group"), PAYMENTS, TOL).matched
+
+
+# ----------------------------------------------------------------- tier 2b: fuzzy name + exact amount
+
+def test_misspelled_payer_with_exact_amount_matches_fuzzily():
+    a = only(match(txn(None, "356.13", "Stelar Group"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_4149", M.FUZZY_NAME_AMOUNT)
+    assert "similarity 0.96" in a.notes
+
+
+def test_fuzzy_matches_exact_remaining_balance_of_partial_payment():
+    a = only(match(txn(None, "190.18", "Prime Logistic"), PAYMENTS, TOL))   # 243.98 - 53.80
+    assert (a.payment_id, a.match_type) == ("p_2486", M.FUZZY_NAME_AMOUNT)
+
+
+def test_fuzzy_requires_exact_amount_no_fee_tolerance():
+    # 349.01 would match Stellar via tolerance with the exact name, not with a misspelled one.
+    assert only(match(txn(None, "349.01", "Stellar Group"), PAYMENTS, TOL)).match_type is M.NAME_AMOUNT
+    r = match(txn(None, "349.01", "Stelar Group"), PAYMENTS, TOL)
+    assert not r.matched and "exactly" in r.reason
+
+
+def test_fuzzy_below_threshold_does_not_match():
+    r = match(txn(None, "356.13", "Stellar Holdings"), PAYMENTS, TOL)
+    assert not r.matched
+
+
+def test_threshold_is_configurable():
+    assert not match(txn(None, "356.13", "Stelar Group"), PAYMENTS, TOL, name_threshold=0.99).matched
+
+
+def test_names_differing_only_by_number_never_fuzzy_match():
+    payments = [pay("s1", "R-1", "100.00", "Store 1")]
+    r = match(txn(None, "100.00", "Store 2"), payments, TOL)
+    assert not r.matched
+
+
+def test_fuzzy_ambiguous_is_unmatched():
+    payments = [pay("a", "R-1", "100.00", "Acme Trading"), pay("b", "R-2", "100.00", "Acme Tradings")]
+    r = match(txn(None, "100.00", "Acme Tradng"), payments, TOL)
+    assert not r.matched and "ambiguous" in r.reason
+
+
+def test_fuzzy_not_used_when_exact_payer_exists_but_amount_does_not_fit():
+    # Exact-name candidates take precedence; fuzzy must not reach a different payer.
+    payments = PAYMENTS + [pay("p_other", "R-9", "96.94", "Pinnacle Enterprise Group")]
+    r = match(txn("UNKNOWN-DD9DED6E", "96.94", "Pinnacle Enterprises"), payments, TOL)
+    assert not r.matched
+
+
+def test_fuzzy_refund_reverses_exact_earlier_amount():
+    a = only(match(txn(None, "-53.80", "Prime Logistic"), PAYMENTS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_2486", M.FUZZY_NAME_AMOUNT)
+    assert "refund" in a.notes
+
+
+def test_fuzzy_respects_currency():
+    payments = [pay("e", "R-1", "100.00", "Stellar Group", currency="EUR")]
+    assert not match(txn(None, "100.00", "Stelar Group"), payments, TOL).matched
+
+
+# ----------------------------------------------------------------- references in any format
+# Regression: references used to count only if they matched REF|ORD|PAY|INV-YYYY-NNNN.
+
+OTHER_FORMATS = [
+    pay("p_doc", "INV-2024-001", "1000.00", "Acme Corporation"),   # format from storage.py docstring
+    pay("p_abc", "ABC123", "250.00", "Globex Inc"),
+    pay("p_abc2", "ABC1234", "250.00", "Globex Inc"),
+    pay("p_short", "A1", "75.00", "Initech"),
+]
+
+
+def test_reference_from_provided_docstring_format_matches_exactly():
+    a = only(match(txn("INV-2024-001", "1000.00", "ACME CORP"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_doc", M.EXACT_REF)
+
+
+def test_arbitrary_reference_matches_exactly_not_ambiguous():
+    a = only(match(txn("ABC123", "250.00", "Globex Inc"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_abc", M.EXACT_REF)
+
+
+def test_exact_reference_is_case_and_whitespace_insensitive():
+    a = only(match(txn("  abc123 ", "250.00", "Globex Inc"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_abc", M.EXACT_REF)
+
+
+def test_any_format_reference_found_inside_text():
+    a = only(match(txn("Payment for ABC123 thanks", "250.00", "Globex"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_abc", M.EXTRACTED_REF)
+
+
+def test_embedded_reference_needs_whole_token():
+    # 'ABC1234' contains 'ABC123' but must resolve to the longer reference only.
+    a = only(match(txn("Payment ABC1234", "250.00", "Globex"), OTHER_FORMATS, TOL))
+    assert a.payment_id == "p_abc2"
+
+
+def test_short_reference_matches_exactly_but_not_inside_text():
+    assert only(match(txn("A1", "75.00", "Initech"), OTHER_FORMATS, TOL)).match_type is M.EXACT_REF
+    # Not found as a reference inside text; matched only via the payer + amount fallback.
+    a = only(match(txn("ROUTE A1 TRANSFER", "75.00", "Initech"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_short", M.NAME_AMOUNT)
+
+
+def test_multiple_any_format_references_split():
+    r = match(txn("ABC123, INV-2024-001", "1250.00", "x"), OTHER_FORMATS, TOL)
+    assert [(a.payment_id, a.amount, a.match_type) for a in r.allocations] == [
+        ("p_abc", D("250.00"), M.MULTI_REF),
+        ("p_doc", D("1000.00"), M.MULTI_REF),
+    ]
+
+
+def test_free_text_reference_falls_back_to_name_and_amount():
+    a = only(match(txn("November invoice", "1000.00", "Acme Corporation"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_doc", M.NAME_AMOUNT)
+    assert "matched no payment" in a.notes
+
+
+@pytest.mark.parametrize("placeholder", ["UNKNOWN-2B943F38", "unknown", "N/A", "NONE", "null", "-", "   "])
+def test_placeholder_references_fall_through_to_name_and_amount(placeholder):
+    a = only(match(txn(placeholder, "1000.00", "Acme Corporation"), OTHER_FORMATS, TOL))
+    assert (a.payment_id, a.match_type) == ("p_doc", M.NAME_AMOUNT)
+
+
+# ----------------------------------------------------------------- nested references
+
+NESTED = [
+    pay("p_long", "REF-2026-1234", "100.00", "Acme"),
+    pay("p_short", "1234", "50.00", "Other Co"),
+]
+
+
+def test_reference_nested_in_another_is_not_a_second_hit():
+    a = only(match(txn("INV REF-2026-1234", "100.00", "Acme"), NESTED, TOL))
+    assert (a.payment_id, a.amount, a.match_type) == ("p_long", D("100.00"), M.EXTRACTED_REF)
+
+
+def test_nested_reference_does_not_take_money_from_partly_paid_payment():
+    payments = [pay("p_long", "REF-2026-1234", "100.00", "Acme", received="40.00", linked=("40.00",)), NESTED[1]]
+    a = only(match(txn("INV REF-2026-1234", "100.00", "Acme"), payments, TOL))
+    assert (a.payment_id, a.amount) == ("p_long", D("100.00"))
+
+
+def test_multi_reference_never_writes_zero_link_to_last_payment():
+    payments = [pay("p_a", "REF-2026-0001", "100.00", "x"), pay("p_b", "REF-2026-0002", "50.00", "x")]
+    r = match(txn("REF-2026-0001 REF-2026-0002", "100.00", "x"), payments, TOL)
+    assert [(a.payment_id, a.amount) for a in r.allocations] == [("p_a", D("100.00"))]

@@ -17,6 +17,7 @@ transaction that arrived before its payment is picked up when the payment lands.
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 from threading import Lock
 
@@ -69,13 +70,23 @@ def _payment_views(storage: JsonStorage) -> dict[str, PaymentView]:
     return views
 
 
-def _transaction_view(t: dict) -> TransactionView:
+def _grace_elapsed(t: dict, now: datetime, grace: timedelta) -> bool:
+    """Has this transaction waited out the reference grace period since we received it?"""
+    try:
+        received = datetime.fromisoformat(t["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return True  # no usable receipt time: don't block forever
+    return now - received >= grace
+
+
+def _transaction_view(t: dict, now: datetime, grace: timedelta) -> TransactionView:
     return TransactionView(
         transaction_id=t["transaction_id"],
         reference=t.get("reference"),
         amount=_dec(t.get("amount")),
         currency=t.get("currency") or "USD",
         payer_name=t.get("payer_name"),
+        reference_fallback_allowed=_grace_elapsed(t, now, grace),
     )
 
 
@@ -111,9 +122,16 @@ def _refresh_payments(storage: JsonStorage, payment_ids, tolerance: Tolerance) -
             storage.update_payment(pid, projection)
 
 
-def reconcile(storage: JsonStorage, tolerance: Tolerance | None = None) -> ReconcileReport:
+def reconcile(
+    storage: JsonStorage,
+    tolerance: Tolerance | None = None,
+    now: datetime | None = None,
+) -> ReconcileReport:
     """Match every unmatched transaction that can now be matched."""
     tolerance = tolerance or default_tolerance()
+    # Storage timestamps are naive local time (datetime.now()); compare like with like.
+    now = now or datetime.now()
+    grace = timedelta(minutes=settings.reference_grace_minutes)
     with _reconcile_lock:
         payments = _payment_views(storage)
         linked_txn_ids = {l["transaction_id"] for l in storage.get_all_reconciliation_links()}
@@ -130,7 +148,7 @@ def reconcile(storage: JsonStorage, tolerance: Tolerance | None = None) -> Recon
                 _refresh_payments(storage, _repair_flag(storage, t["transaction_id"]), tolerance)
                 continue
 
-            result = match(_transaction_view(t), list(payments.values()), tolerance)
+            result = match(_transaction_view(t, now, grace), list(payments.values()), tolerance, settings.fuzzy_name_threshold)
 
             if not result.matched:
                 if t.get("unmatched_reason") != result.reason:

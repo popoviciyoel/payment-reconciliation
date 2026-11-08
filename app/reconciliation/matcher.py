@@ -4,32 +4,46 @@ Transaction -> payment matching (pure, no I/O).
 Tiers, tried in order; the first that yields an unambiguous answer wins
 (DESIGN.md §5). Currency must always match.
 
-  1. Reference: extract well-formed references from the transaction.
-       - one hit           -> EXACT_REF / EXTRACTED_REF, full amount
-       - several hits      -> MULTI_REF, amount spread across remaining balances
-       - refs but no hit   -> unmatched (the payment may not have arrived yet;
-                              we don't fall back to name matching, which could
-                              grab the wrong invoice in the meantime)
-  2. No usable reference (empty, `UNKNOWN-*`):
+  1. Reference (any format). Only empty and placeholder references
+     (`UNKNOWN-*`, `N/A`, ...) count as "no reference".
+       - normalized reference equals a payment's    -> EXACT_REF
+       - else known payment references found inside
+         the text (plus well-formed REF/ORD/PAY/INV-YYYY-NNNN):
+           one hit                                  -> EXTRACTED_REF
+           several hits                             -> MULTI_REF, spread across balances
+       - reference but no payment has it            -> wait out a grace period (the
+         payment may not have arrived yet), then fall through to tier 2, since
+         references aren't always informative; link notes record the fallback
+  2. No usable reference (empty, placeholder, or matching no payment):
        - payment: same normalized payer + amount within tolerance of the
                   remaining balance                                -> NAME_AMOUNT
        - refund:  same normalized payer + magnitude equals a payment
                   previously linked to that payer's payment         -> REFUND_NAME_AMOUNT
        Only when exactly one payment qualifies.
+  2b. Only if tier 2 found no candidate at all: payer name *similar*
+       (similarity >= threshold, same numbers in both names) + amount
+       *exactly* equal to the remaining balance (refund: exactly reverses an
+       earlier linked amount). A weaker name signal demands a stronger amount
+       signal, so no fee tolerance here.                   -> FUZZY_NAME_AMOUNT
+       Only when exactly one payment qualifies.
   3. Otherwise unmatched, with a reason.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from enum import Enum
 
 from app.domain.status import Tolerance
 from app.reconciliation.normalize import (
-    extract_references,
+    find_references,
+    is_placeholder_reference,
     name_similarity,
     normalize_name,
     normalize_reference,
+    numbers_agree,
 )
+
+DEFAULT_NAME_SIMILARITY_THRESHOLD = 0.85
 
 
 class MatchType(str, Enum):
@@ -38,6 +52,7 @@ class MatchType(str, Enum):
     MULTI_REF = "MULTI_REF"
     NAME_AMOUNT = "NAME_AMOUNT"
     REFUND_NAME_AMOUNT = "REFUND_NAME_AMOUNT"
+    FUZZY_NAME_AMOUNT = "FUZZY_NAME_AMOUNT"
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,9 @@ class TransactionView:
     amount: Decimal
     currency: str
     payer_name: str | None
+    # False while a reference that matches no payment is still within its grace
+    # period (decided by the caller, which owns the clock).
+    reference_fallback_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -87,36 +105,60 @@ def _unmatched(reason: str) -> MatchResult:
     return MatchResult((), reason)
 
 
-def match(txn: TransactionView, payments: list[PaymentView], tolerance: Tolerance) -> MatchResult:
+def match(
+    txn: TransactionView,
+    payments: list[PaymentView],
+    tolerance: Tolerance,
+    name_threshold: float = DEFAULT_NAME_SIMILARITY_THRESHOLD,
+) -> MatchResult:
     if txn.amount == 0:
         return _unmatched("zero amount")
 
-    refs = extract_references(txn.reference)
-    if refs:
-        return _match_by_reference(txn, refs, payments)
-    return _match_by_name_and_amount(txn, payments, tolerance)
+    ref = normalize_reference(txn.reference)
+    if is_placeholder_reference(ref):
+        return _match_by_name_and_amount(txn, payments, tolerance, name_threshold)
+
+    result = _match_by_reference(txn, ref, payments)
+    if result is not None:
+        return result
+
+    # The reference matched no payment: after the grace period, fall back to
+    # payer + amount, and say so.
+    context = f"reference {txn.reference.strip()!r} matched no payment"
+    if not txn.reference_fallback_allowed:
+        return _unmatched(f"{context} yet; waiting for it before matching on payer + amount")
+    fallback = _match_by_name_and_amount(txn, payments, tolerance, name_threshold)
+    if fallback.matched:
+        return MatchResult(tuple(
+            replace(a, notes=f"{context}; {a.notes}") for a in fallback.allocations
+        ))
+    return _unmatched(f"{context}; {fallback.reason}")
 
 
 # --------------------------------------------------------------------------- tier 1
 
 
-def _match_by_reference(txn: TransactionView, refs: list[str], payments: list[PaymentView]) -> MatchResult:
+def _match_by_reference(txn: TransactionView, ref: str, payments: list[PaymentView]) -> MatchResult | None:
+    """Match on reference; None if no payment has any reference found in the text."""
     by_ref: dict[str, list[PaymentView]] = {}
     for p in payments:
         key = normalize_reference(p.reference)
         if key:
             by_ref.setdefault(key, []).append(p)
 
+    # Exact equality first, whatever the format; search inside the text only if that fails.
+    refs = [ref] if ref in by_ref else find_references(ref, by_ref.keys())
+
     hits: list[PaymentView] = []
-    for ref in refs:
-        found = by_ref.get(ref, [])
+    for r in refs:
+        found = by_ref.get(r, [])
         if len(found) > 1:
-            return _unmatched(f"reference {ref} is shared by {len(found)} payments")
+            return _unmatched(f"reference {r} is shared by {len(found)} payments")
         if found:
             hits.append(found[0])
 
     if not hits:
-        return _unmatched(f"no payment with reference {', '.join(refs)} (yet)")
+        return None
 
     wrong_currency = [p for p in hits if p.currency != txn.currency]
     if wrong_currency:
@@ -154,8 +196,8 @@ def _allocate_multi(txn: TransactionView, hits: list[PaymentView]) -> MatchResul
     for i, p in enumerate(hits):
         last = i == len(hits) - 1
         share = left if last else min(left, max(p.remaining, Decimal("0")))
-        if share <= 0 and not last:
-            continue
+        if share <= 0:
+            continue  # nothing left for this payment: never write a zero/negative link
         allocations.append(Allocation(
             payment_id=p.payment_id,
             amount=share,
@@ -170,35 +212,69 @@ def _allocate_multi(txn: TransactionView, hits: list[PaymentView]) -> MatchResul
 
 
 def _match_by_name_and_amount(
-    txn: TransactionView, payments: list[PaymentView], tolerance: Tolerance
+    txn: TransactionView, payments: list[PaymentView], tolerance: Tolerance, name_threshold: float
 ) -> MatchResult:
     payer = normalize_name(txn.payer_name)
     if not payer:
         return _unmatched("no usable reference and no payer name")
 
-    same_payer = [
-        p for p in payments
-        if p.currency == txn.currency and normalize_name(p.payer_name) == payer
-    ]
-    if not same_payer:
-        return _unmatched(f"no usable reference; no {txn.currency} payments from {txn.payer_name!r}")
+    same_currency = [p for p in payments if p.currency == txn.currency]
+    same_payer = [p for p in same_currency if normalize_name(p.payer_name) == payer]
 
-    if txn.amount > 0:
-        fits = [p for p in same_payer if p.remaining > 0 and tolerance.covers(txn.amount, p.remaining)]
-        match_type = MatchType.NAME_AMOUNT
-        note = "no usable reference; payer and amount match remaining balance"
-    else:
-        magnitude = -txn.amount
-        fits = [p for p in same_payer if magnitude in p.linked_amounts]
-        match_type = MatchType.REFUND_NAME_AMOUNT
-        note = "refund with no usable reference; reverses an equal earlier payment from this payer"
+    # Tier 2: exact (normalized) payer + amount within fee tolerance.
+    if same_payer:
+        if txn.amount > 0:
+            fits = [p for p in same_payer if p.remaining > 0 and tolerance.covers(txn.amount, p.remaining)]
+            match_type = MatchType.NAME_AMOUNT
+            note = "no usable reference; payer and amount match remaining balance"
+        else:
+            fits = [p for p in same_payer if -txn.amount in p.linked_amounts]
+            match_type = MatchType.REFUND_NAME_AMOUNT
+            note = "refund with no usable reference; reverses an equal earlier payment from this payer"
 
-    if not fits:
+        if len(fits) == 1:
+            return MatchResult((Allocation(fits[0].payment_id, txn.amount, match_type, note),))
+        if len(fits) > 1:
+            return _unmatched(f"no usable reference; ambiguous between {', '.join(p.payment_id for p in fits)}")
+        # Exact-name candidates exist but none fit: a fuzzy pass can't do better
+        # (it requires an exact amount over *other* payers), so stop here.
         return _unmatched(
             f"no usable reference; no open payment from {txn.payer_name!r} fits amount {txn.amount}"
         )
-    if len(fits) > 1:
-        ids = ", ".join(p.payment_id for p in fits)
-        return _unmatched(f"no usable reference; ambiguous between {ids}")
 
-    return MatchResult((Allocation(fits[0].payment_id, txn.amount, match_type, note),))
+    # Tier 2b: similar payer name + exact amount.
+    return _match_by_similar_name(txn, same_currency, name_threshold)
+
+
+def _match_by_similar_name(
+    txn: TransactionView, candidates: list[PaymentView], name_threshold: float
+) -> MatchResult:
+    similar = [
+        (p, score) for p in candidates
+        if numbers_agree(txn.payer_name, p.payer_name)
+        and (score := name_similarity(txn.payer_name, p.payer_name)) >= name_threshold
+    ]
+    if not similar:
+        return _unmatched(f"no usable reference; no {txn.currency} payments from {txn.payer_name!r} or a similar name")
+
+    if txn.amount > 0:
+        fits = [(p, s) for p, s in similar if p.remaining > 0 and txn.amount == p.remaining]
+        what = "amount exactly matches remaining balance"
+    else:
+        fits = [(p, s) for p, s in similar if -txn.amount in p.linked_amounts]
+        what = "refund exactly reverses an earlier linked amount"
+
+    if not fits:
+        names = ", ".join(sorted({repr(p.payer_name) for p, _ in similar}))
+        return _unmatched(f"no usable reference; similar payer {names} but no payment with exactly {txn.amount}")
+    if len(fits) > 1:
+        return _unmatched(f"no usable reference; ambiguous between {', '.join(p.payment_id for p, _ in fits)}")
+
+    p, score = fits[0]
+    return MatchResult((Allocation(
+        payment_id=p.payment_id,
+        amount=txn.amount,
+        match_type=MatchType.FUZZY_NAME_AMOUNT,
+        notes=f"no usable reference; payer {txn.payer_name!r} ~ {p.payer_name!r} "
+              f"(similarity {score} >= {name_threshold}); {what}",
+    ),))
