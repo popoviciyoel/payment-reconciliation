@@ -202,3 +202,14 @@ def test_grace_is_measured_from_receipt_not_settlement(store):
     # Settled long ago, but we only just received it: still waits.
     add_txn(store, "t1", "November invoice", "100.00", payer="ACME CORP", settled="2020-01-01T00:00:00")
     assert reconcile(store, TOL).matched == 0
+
+
+def test_multi_reference_waits_for_missing_payment_then_splits(store):
+    add_payment(store, "p1", "ORD-2026-0505", "100.00")
+    add_txn(store, "t1", "ORD-2026-0505 ORD-2026-0506", "300.00")
+    reconcile(store, TOL)
+    assert not store.get_transaction("t1")["matched"]          # waiting, not OVERPAID on p1
+    add_payment(store, "p2", "ORD-2026-0506", "200.00")
+    reconcile(store, TOL)
+    assert {l["payment_id"]: l["amount"] for l in store.get_links_for_transaction("t1")} == {"p1": "100.00", "p2": "200.00"}
+    assert store.get_payment("p1")["status"] == store.get_payment("p2")["status"] == "FULLY_PAID"

@@ -73,7 +73,7 @@ ngrok's free tier issues a new URL on every restart; re-subscribe when it change
 pytest
 ```
 
-397 tests (13 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
+409 tests (10 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
 the matcher (with real provider cases as fixtures), the engine (including crash safety), the
 query API, and end-to-end replays of simulated data (`tests/test_simulated_data.py`):
 
@@ -162,8 +162,9 @@ those cases (DESIGN.md §4).
 | Tier | Rule | Match type |
 |---|---|---|
 | 1 | Reference in any format: exact match (case/whitespace-insensitive) to a payment's reference; otherwise a known payment reference found inside noisy text | `EXACT_REF` / `EXTRACTED_REF` |
-| 1b | Several references → split across them, filling each remaining balance in order | `MULTI_REF` |
+| 1b | Several references → split across them, filling each remaining balance in order (waits out the grace period if one referenced payment hasn't arrived) | `MULTI_REF` |
 | 2 | No usable reference (empty, a placeholder like `UNKNOWN-*`, or a reference matching no payment after the grace period): same normalized payer + amount within fee tolerance of the remaining balance; exactly one candidate | `NAME_AMOUNT` (refunds: `REFUND_NAME_AMOUNT`) |
+| 2c | Exact payer, no single payment fits: amount **exactly** equals the combined open balances of 2–3 of that payer's payments; exactly one combination | `MULTI_NAME_AMOUNT` |
 | 2b | No same-payer candidate at all: payer-name similarity ≥ 0.85 (same numbers in both names) + **exact** amount; exactly one candidate | `FUZZY_NAME_AMOUNT` |
 | 3 | Otherwise unmatched, with a recorded reason | — |
 
@@ -273,8 +274,8 @@ non-reproducible results on financial data.
   `matched_payment_ids`.
 
 **Known limitations today:** single process only (locks are in-process); a tolerance
-change applies on restart and doesn't redo existing links; refunds and multi-payment
-splits are tested but haven't yet appeared in provider data.
+change applies on restart and doesn't redo existing links; refunds and transactions covering several
+payments are tested but haven't yet appeared in provider data.
 
 ---
 
@@ -314,7 +315,7 @@ including how to weigh each trade-off, were mine.
   out-of-order delivery).
 
 **How I validated the AI's output**
-- **Tests:** 397 automated tests, many using real provider events as fixtures, plus
+- **Tests:** 409 automated tests, many using real provider events as fixtures, plus
   replays of seeded simulated data with known correct answers. The matcher must never
   link money to the wrong payment.
 - **Against live data:** checked every stored event and match outcome (24 of 27

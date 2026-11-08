@@ -5,7 +5,13 @@ from decimal import Decimal as D
 import pytest
 
 from app.domain.status import Tolerance
-from app.reconciliation.matcher import MatchType as M, PaymentView, TransactionView, match
+from app.reconciliation.matcher import (
+    MAX_OPEN_PAYMENTS_FOR_COMBINATIONS,
+    MatchType as M,
+    PaymentView,
+    TransactionView,
+    match,
+)
 
 TOL = Tolerance(percent=D("2"))
 
@@ -330,3 +336,83 @@ def test_multi_reference_never_writes_zero_link_to_last_payment():
     payments = [pay("p_a", "REF-2026-0001", "100.00", "x"), pay("p_b", "REF-2026-0002", "50.00", "x")]
     r = match(txn("REF-2026-0001 REF-2026-0002", "100.00", "x"), payments, TOL)
     assert [(a.payment_id, a.amount) for a in r.allocations] == [("p_a", D("100.00"))]
+
+
+# ----------------------------------------------------------------- multi-reference with a missing payment
+
+def waiting(t):
+    return TransactionView(t.transaction_id, t.reference, t.amount, t.currency, t.payer_name,
+                           reference_fallback_allowed=False)
+
+
+def test_multi_reference_waits_while_a_referenced_payment_is_missing():
+    r = match(waiting(txn("ORD-2026-4149 ORD-2026-0001", "400.00", "Stellar Group")), PAYMENTS, TOL)
+    assert not r.matched and "ORD-2026-0001" in r.reason and "waiting" in r.reason
+
+
+def test_single_known_plus_missing_reference_also_waits():
+    # Previously the known payment took the whole amount and became OVERPAID.
+    r = match(waiting(txn("REF-2026-6981 REF-2026-0002", "5000.00", "Quantum Dynamics")), PAYMENTS, TOL)
+    assert not r.matched
+
+
+def test_after_grace_allocates_across_existing_and_notes_missing():
+    r = match(txn("ORD-2026-4149 ORD-2026-0001", "400.00", "Stellar Group"), PAYMENTS, TOL)
+    [a] = r.allocations
+    assert (a.payment_id, a.amount) == ("p_4149", D("400.00"))
+    assert "ORD-2026-0001 matched no payment after the grace period" in a.notes
+
+
+# ----------------------------------------------------------------- tier 2c: one transaction, several invoices
+
+COMBO = [
+    pay("c1", "R-1", "100.00", "Acme"),
+    pay("c2", "R-2", "250.00", "Acme"),
+    pay("c3", "R-3", "75.00", "Acme", received="25.00", linked=["25.00"]),   # 50.00 remaining
+    pay("c4", "R-4", "999.00", "Other Co"),
+]
+
+
+def test_amount_equal_to_two_open_balances_splits_across_them():
+    r = match(txn(None, "350.00", "ACME"), COMBO, TOL)
+    assert [(a.payment_id, a.amount, a.match_type) for a in r.allocations] == [
+        ("c1", D("100.00"), M.MULTI_NAME_AMOUNT),
+        ("c2", D("250.00"), M.MULTI_NAME_AMOUNT),
+    ]
+
+
+def test_combination_uses_remaining_balance_and_up_to_three_payments():
+    r = match(txn(None, "400.00", "Acme"), COMBO, TOL)    # 100 + 250 + 50 remaining
+    assert {a.payment_id: a.amount for a in r.allocations} == {"c1": D("100.00"), "c2": D("250.00"), "c3": D("50.00")}
+
+
+def test_combination_requires_exact_sum_no_fee_tolerance():
+    assert not match(txn(None, "349.00", "Acme"), COMBO, TOL).matched
+
+
+def test_ambiguous_combinations_are_unmatched():
+    payments = [pay("a", "R-1", "100.00", "Acme"), pay("b", "R-2", "50.00", "Acme"),
+                pay("c", "R-3", "60.00", "Acme"), pay("d", "R-4", "90.00", "Acme")]
+    r = match(txn(None, "150.00", "Acme"), payments, TOL)   # a+b or c+d
+    assert not r.matched and "several combinations" in r.reason
+
+
+def test_single_payment_fit_wins_over_combination():
+    payments = COMBO + [pay("c5", "R-5", "350.00", "Acme")]
+    a = only(match(txn(None, "350.00", "Acme"), payments, TOL))
+    assert (a.payment_id, a.match_type) == ("c5", M.NAME_AMOUNT)
+
+
+def test_combinations_never_cross_payers_or_use_fuzzy_names():
+    assert not match(txn(None, "1099.00", "Acme"), COMBO, TOL).matched          # c1 + c4 (Other Co)
+    assert not match(txn(None, "350.00", "Acmee Ltd Group"), COMBO, TOL).matched
+
+
+def test_too_many_open_payments_skips_combination_search():
+    payments = [pay(f"p{i}", f"R-{i}", f"{i + 1}.00", "Acme") for i in range(MAX_OPEN_PAYMENTS_FOR_COMBINATIONS + 1)]
+    r = match(txn(None, "0.50", "Acme"), payments, TOL)
+    assert not r.matched and "too many" in r.reason
+
+
+def test_refund_never_uses_combinations():
+    assert not match(txn(None, "-350.00", "Acme"), COMBO, TOL).matched
