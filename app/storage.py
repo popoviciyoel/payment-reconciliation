@@ -39,6 +39,7 @@ Usage:
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -84,9 +85,28 @@ class JsonStorage:
         }
 
     def _save(self) -> None:
-        """Persist data to JSON file"""
-        with open(self.file_path, "w") as f:
-            json.dump(self._data, f, indent=2, default=str)
+        """
+        Persist data to the JSON file atomically.
+
+        Writes to a temp file, fsyncs, then os.replace()s it over the real file,
+        so a crash mid-write leaves the previous complete file intact instead of
+        a truncated one (which _load would discard as corrupt, losing all data).
+
+        If the write fails, in-memory state is reloaded from disk so memory never
+        runs ahead of what was persisted.
+        """
+        tmp_path = self.file_path.with_name(self.file_path.name + ".tmp")
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(self._data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.file_path)
+        except Exception:
+            logger.exception("Failed to persist storage; reverting in-memory state to disk")
+            tmp_path.unlink(missing_ok=True)
+            self._data = self._load()
+            raise
 
     def reset(self) -> None:
         """Clear all data (useful for testing)"""
@@ -245,19 +265,60 @@ class JsonStorage:
             payment_id, transaction_id, match_type, amount, notes
         """
         with self._lock:
-            link_record = {
-                "link_id": generate_id("link"),
-                "payment_id": link.get("payment_id"),
-                "transaction_id": link.get("transaction_id"),
-                "match_type": link.get("match_type"),  # EXACT, FUZZY_REF, AMOUNT_ONLY, etc.
-                "amount": link.get("amount"),
-                "notes": link.get("notes"),
-                "created_at": datetime.now().isoformat(),
-            }
-
+            link_record = self._build_link(link)
             self._data["reconciliation_links"].append(link_record)
             self._save()
             return link_record
+
+    @staticmethod
+    def _build_link(link: dict) -> dict:
+        return {
+            "link_id": generate_id("link"),
+            "payment_id": link.get("payment_id"),
+            "transaction_id": link.get("transaction_id"),
+            "match_type": link.get("match_type"),  # EXACT, FUZZY_REF, AMOUNT_ONLY, etc.
+            "amount": link.get("amount"),
+            "notes": link.get("notes"),
+            "created_at": datetime.now().isoformat(),
+        }
+
+    def record_match(
+        self,
+        transaction_id: str,
+        links: list[dict],
+        transaction_updates: dict,
+        payment_updates: dict[str, dict],
+    ) -> list[dict]:
+        """
+        Atomically record a reconciliation result: append the links, update the
+        transaction and the affected payments, then persist once.
+
+        Either everything is applied and saved, or nothing is: inputs are
+        validated before any mutation, and a failed save reverts memory to disk.
+        """
+        with self._lock:
+            txn = self._data["transactions"].get(transaction_id)
+            if txn is None:
+                raise KeyError(f"unknown transaction {transaction_id}")
+            referenced = {link.get("payment_id") for link in links} | set(payment_updates)
+            missing = [pid for pid in referenced if pid not in self._data["payments"]]
+            if missing:
+                raise KeyError(f"unknown payments {missing}")
+
+            link_records = [self._build_link({**link, "transaction_id": transaction_id}) for link in links]
+            now = datetime.now().isoformat()
+
+            self._data["reconciliation_links"].extend(link_records)
+            txn.update(transaction_updates)
+            for pid, updates in payment_updates.items():
+                self._data["payments"][pid].update(updates)
+                self._data["payments"][pid]["updated_at"] = now
+            self._save()
+            return link_records
+
+    def get_links_for_transaction(self, transaction_id: str) -> list[dict]:
+        """Get all reconciliation links for a transaction"""
+        return [link for link in self._data["reconciliation_links"] if link.get("transaction_id") == transaction_id]
 
     def get_links_for_payment(self, payment_id: str) -> list[dict]:
         """Get all reconciliation links for a payment"""
