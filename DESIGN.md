@@ -105,6 +105,32 @@ request
 - **Defence in depth.** The engine treats any transaction that already has a link as matched
   regardless of its flag, repairs the flag, and never links it twice.
 
+### Rate limiting ✅
+`app/core/rate_limit.py`, in-memory token bucket per client.
+
+- **Scope:** `GET /payments` and `GET /payments/{id}` share one bucket per client
+  (`RATE_LIMIT_PER_MINUTE`=60 refill, `RATE_LIMIT_BURST`=20; the `/ui` page polls every
+  5 s, i.e. 12/min per tab). `/`, `/docs` and the `/ui` page itself are not limited.
+- **Webhooks:** correctly signed requests are **never** limited — the signature is the
+  access control, and a `429` would make the provider retry or drop events. The signature
+  is checked first; only *failed* attempts draw from a separate per-client bucket
+  (`INVALID_SIGNATURE_LIMIT_PER_MINUTE`=10), after which the client gets `429` instead of
+  `401`. A valid webhook from a limited client is still accepted.
+- **Responses:** `429` with `Retry-After`; `X-RateLimit-Limit` (burst size) and
+  `X-RateLimit-Remaining` on query responses. Any setting at 0 disables that limit.
+- **Client identity — the trap:** behind ngrok or any reverse proxy,
+  `request.client.host` is the proxy, so every client would share one bucket. The real IP
+  is in `X-Forwarded-For`, but anyone can fake that header unless a trusted proxy sets it.
+  It is honoured **only** when the connection comes from an address in `TRUSTED_PROXIES`
+  (empty by default), and then only its right-most entry — the one our proxy appended;
+  everything to its left is client-supplied. Otherwise a client could dodge the limit, or
+  drain another client's bucket, by sending a different header on each request.
+- **Why not `slowapi`:** a small dependency keeps "limit only failed signatures" simple,
+  avoids a new package, and takes an injectable clock for deterministic tests.
+- **Memory:** at most 10,000 tracked clients; fully refilled (idle) buckets are evicted
+  first, so random keys can't grow memory without bound.
+- **Limits:** single process only.
+
 ### Money handling ✅
 - Amounts arrive as strings and are parsed to `Decimal`; floats are never used.
 - Amounts are persisted as strings to keep the JSON file lossless.
@@ -114,13 +140,24 @@ request
   (git-ignored). The README says to derive the matching logic "based on the data you
   receive", so we capture real data before tuning the matcher.
 
-### No AI/LLM in the matching path
-Deterministic rules are auditable, reproducible, testable and free to run; an LLM would
-hide the algorithm (which is being evaluated), add cost/latency/an API key dependency,
-and produce non-reproducible results on financial data. Fuzzy string similarity
-(`difflib` / `rapidfuzz`) covers name and reference variants. An LLM-assisted *review
-queue* for unmatched transactions is listed under future improvements.
+### AI for analysis, deterministic rules for linking money
+The system has two jobs with different needs, and each gets the tool that suits it.
 
+**Linking money to invoices: deterministic rules.** This step changes balances on every
+webhook, so it must be reproducible (same input, same links), auditable (every link says
+why), testable, and free and fast to run. An LLM here would give non-reproducible results
+on financial data, hide the algorithm, and add cost, latency and an API-key dependency to
+every event. Fuzzy string similarity (`difflib`) covers name variants.
+
+**Analysis: an AI agent.** AI is very good at exactly what the rules are weak at:
+reading **unstructured data** (free-text references, payer names, notes), **reasoning**
+about what a payer most likely meant, and **detecting patterns** across many events that
+no one wrote a rule for. That is how this project's rules were made in the first place:
+AI analysis of the raw webhook log classified the cases in §4 (noisy, missing and
+placeholder references, partial and short payments, name variants, duplicate deliveries),
+and the matching tiers were built from that analysis. The proposed analysis agent (§9)
+makes that a permanent part of the system: the agent analyses and proposes, the
+deterministic engine decides, and a human approves anything in between.
 ---
 
 ## 4. Observed provider data
@@ -155,6 +192,15 @@ derived from this, not from guesses.
   misallocate money.
 - **Name + exact amount is reliable when the reference is missing** — both empty-reference
   transactions match a single payment to the cent.
+
+- **The account number carries no identity signal here.** Payments have no account field,
+  so `payer_account_last_four` could only be used *indirectly*: learn "account X belongs to
+  payer Y" from reference matches, then use it to corroborate a fuzzy name. In the data
+  every transaction has a different last-four (27 transactions, 27 values), and the same
+  payer uses a new one each time (Prime Logistics: 6282, 8061, 8549, 9460 — all matched by
+  exact reference). A learned account would never recur, so the signal is not used (Q11).
+  Even with stable accounts, four digits collide easily (~39% chance of a shared value
+  among 100 payer accounts), so it could only ever *support* a match, never decide one.
 
 ### Delivery behaviour
 
@@ -372,6 +418,7 @@ Questions we would ask the assignment authors; current handling noted for each.
 | Q8 | Are the `PENDING / PARTIALLY_PAID / FULLY_PAID / OVERPAID` statuses exhaustive, or is something like `REFUNDED` expected? | Using only the four specified |
 | Q9 | When a fallback (payer + amount) link turns out wrong because the referenced payment arrives *after* the grace period, should the link be **moved** to it automatically? | Open. Not implemented: links are immutable. Option: mark fallback links provisional and, when a payment arrives whose reference exactly equals the transaction's, move the link atomically and recalculate both payments (the first payment's status may regress). |
 | Q10 | What grace period suits the provider? | 15 minutes by default, configurable. Observed payments arrived before their transactions, so the wait rarely matters live; shuffled simulations show it's what prevents wrong matches. |
+| Q11 | Does the real provider keep `payer_account_last_four` stable per payer? | Not in observed data (a new value on every transaction), so unused. If stable: remember accounts seen on reference-matched transactions per payer, and use a known account as *corroboration* — e.g. let the fuzzy-name tier accept an amount within the fee tolerance instead of an exact amount. Never sufficient on its own (only four digits). |
 
 ---
 
@@ -391,6 +438,69 @@ Questions we would ask the assignment authors; current handling noted for each.
   - keep from-scratch recalculation as a scheduled audit job that reports drift, and
     as an explicit backfill when the fee tolerance changes.
 - Manual review endpoint to confirm/reject low-confidence matches.
-- LLM-assisted *suggestions* (never auto-links) for transactions the rules leave unmatched.
-- Rate limiting on the query API (bonus task); cursor-based pagination for large datasets.
+- **Reconciliation analysis agent** (§9): explains unmatched transactions, suggests matches
+  for human approval, detects patterns and proposes new rules. Advisory only — never writes links.
+- **Rate limiting across instances:** the buckets are in memory (§3 "Rate limiting"), so
+  several instances would each allow the full rate; move them to Redis or an API gateway.
+- Cursor-based pagination for large datasets.
 - Docker / docker-compose.
+
+---
+
+## 9. Reconciliation analysis agent (proposed, not built)
+
+An AI agent alongside the deterministic engine, for the work that needs judgement rather
+than rules. It reads; it never writes links.
+
+### Why an agent
+- **Unstructured data.** Real references are free text (`INV REF-2026-6981`,
+  `November invoice x2`), payer names drift (`apex trading co`, `ACME HLDGS`), and remit
+  notes carry intent. Rules handle the shapes we anticipated; an agent can read the ones
+  we didn't.
+- **Reasoning.** For an unmatched transaction it can weigh several weak signals together —
+  a near-miss name, an amount equal to two open invoices, a reference with a transposed
+  digit — and explain its conclusion in plain language.
+- **Pattern detection.** Across hundreds of events it can notice what no single
+  transaction shows: a new reference format, a payer consistently paying under another
+  name, short payments clustering at a fixed percentage, an account number that turns out
+  to be stable per payer.
+
+### What it does
+| Capability | Input | Output |
+|---|---|---|
+| **Explain unmatched transactions** | The transaction, the matcher's recorded reason, open payments of plausible payers | A plain-language diagnosis, e.g. "free-text reference from Apex; amount equals ORD-2026-2811 + PAY-2026-5038" |
+| **Suggest matches** | Same | Candidate payment(s) with allocation, confidence and reasoning — stored as a *suggestion* for review |
+| **Detect patterns and propose rules** | The raw event log, links and unmatched reasons over time | Proposed rule or setting changes with evidence: new reference formats, payer aliases, a fee percentage (answers Q2), stable account numbers (answers Q11), a better grace period (Q10) |
+| **Reconciliation report** | Summary statistics and the above | A narrative report: match rate, unmatched amount, anomalies, trends |
+
+### How it fits the architecture
+```
+webhooks ─▶ ingest ─▶ deterministic engine ─▶ links (source of truth) ─▶ query API / UI
+                              ▲                         │
+                     approved rules/settings            │ read-only
+                              │                         ▼
+                        human review ◀──── suggestions ◀── analysis agent
+                                           (separate store)   (on demand / scheduled)
+```
+- **Advisory only.** The agent has read-only access to events, payments, links and
+  unmatched reasons. Its output goes to a separate suggestions store, never to links.
+- **Human in the loop.** Approving a suggested match writes a link through the normal
+  atomic path with its own match type (e.g. `AGENT_SUGGESTED_APPROVED`), so it is always
+  distinguishable and auditable. Rejections are kept, to measure the agent's precision.
+- **Proposals become rules.** An approved pattern (e.g. "payer alias ACME HLDGS → Acme
+  Corporation", "fee is 2.9%") becomes a deterministic rule or setting with a test, so
+  the system improves while the money path stays reproducible.
+- **Traceable.** Each suggestion stores its inputs, the model version, the reasoning and
+  the confidence.
+- **Off by default.** Without an API key the agent is disabled; the service, the tests and
+  the matching are unaffected.
+- **Runs off the hot path.** On demand or on a schedule, never per webhook, so latency and
+  cost don't touch ingestion.
+
+### Open points
+- Confidence calibration: measure precision on approved/rejected suggestions and the
+  simulation suite's ground truth before trusting high-confidence suggestions more.
+- Data handling: payer names and emails would be sent to the model provider; this needs
+  the same review as any third-party data processor.
+- Evaluation: replay `tests/fixtures/` (real events, edge cases, generated datasets with
+  known answers) through the agent to score its suggestions before it is used.

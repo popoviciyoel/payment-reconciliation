@@ -33,6 +33,9 @@ cp env.example.txt .env             # then fill in the values below
 | `FUZZY_NAME_THRESHOLD` | Minimum payer-name similarity (0–1) for fuzzy matching | `0.85` |
 | `REFERENCE_GRACE_MINUTES` | How long a transaction whose reference matches no payment waits before payer + amount matching (0 = immediately) | `15` |
 | `RECONCILE_INTERVAL_SECONDS` | Periodic reconciliation interval (0 disables) | `60` |
+| `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_BURST` | Per-client limit on the query endpoints (0 disables) | `60` / `20` |
+| `INVALID_SIGNATURE_LIMIT_PER_MINUTE` | Failed webhook-signature attempts per client before `429` (valid webhooks are never limited) | `10` |
+| `TRUSTED_PROXIES` | Proxies whose `X-Forwarded-For` is trusted for client identity; behind a local ngrok agent use `127.0.0.1,::1` | empty (never trust) |
 | `DEBUG` | Verbose logs; also records rejected webhooks to `data/rejected_events.jsonl` | `false` |
 
 ### Run
@@ -73,7 +76,7 @@ ngrok's free tier issues a new URL on every restart; re-subscribe when it change
 pytest
 ```
 
-411 tests (10 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
+426 tests (10 are strict `xfail` markers for known gaps): signature verification, webhook handling, atomic storage, normalization, status,
 the matcher (with real provider cases as fixtures), the engine (including crash safety), the
 query API, and end-to-end replays of simulated data (`tests/test_simulated_data.py`):
 
@@ -108,9 +111,16 @@ Interactive docs: **http://localhost:8000/docs** (Swagger UI) or `/redoc`.
 `OVERPAID`), `search` (case-insensitive: payment ID, reference, payer name, email),
 `page`, `page_size` (default 20, max 100).
 
+**Rate limiting:** `GET /payments` and `GET /payments/{id}` share a per-client token bucket
+(60/min, bursts of 20). Responses carry `X-RateLimit-Limit` (the burst size) and
+`X-RateLimit-Remaining`; over the limit you get `429` with `Retry-After`. Correctly signed
+webhooks are never limited; after 10 failed signature attempts in a minute a client gets
+`429` instead of `401`.
+
 Webhook responses: `200` stored / duplicate / unknown event type (acknowledged so the
 provider stops retrying), `400` malformed JSON, `401` bad signature, `422` signed but
-invalid payload, `500` server has no webhook secret configured.
+invalid payload, `429` too many invalid-signature attempts, `500` server has no webhook
+secret configured.
 
 ---
 
@@ -126,6 +136,7 @@ app/
     payments.py             query endpoints
     deps.py                 injectable dependencies
   core/signature.py         canonical-JSON HMAC verification
+  core/rate_limit.py        per-client token buckets, trusted-proxy client identity
   domain/
     models.py               inbound event schemas (Decimal amounts)
     schemas.py              API response schemas
@@ -234,11 +245,27 @@ under-calling "fully paid" is the safer error. Refunds are negative links and re
 - The summary in `GET /payments` covers all data, independent of filters and paging.
 - `outstanding_amount` is 0 once a payment is `FULLY_PAID`/`OVERPAID`.
 
-### No AI in the matching path
-Deterministic rules are auditable, reproducible, testable, and free to run. An LLM would
-hide the algorithm, add cost, latency and an API-key dependency, and give
-non-reproducible results on financial data.
+### AI for analysis, deterministic rules for linking money
+AI is very good at handling **unstructured data**, **reasoning**, and **detecting
+patterns** — and that is how this project's matching rules were built: AI analysis of the
+raw webhook log classified the real cases (noisy, missing and placeholder references,
+partial and short payments, payer-name variants, duplicate deliveries), and the tiers
+above came from that analysis.
 
+The step that actually moves money onto invoices stays deterministic: it runs on every
+webhook and must be reproducible, auditable, testable, and free and fast to run.
+
+The design therefore adds an **AI analysis agent** next to the engine (documented, not
+built — DESIGN.md §9). It reads events, links and unmatched reasons, and:
+- **explains unmatched transactions** in plain language;
+- **suggests matches** with confidence and reasoning, for a human to approve;
+- **detects patterns** across events — new reference formats, payer aliases, a consistent
+  fee percentage, stable account numbers — and proposes them as new deterministic rules;
+- **writes a reconciliation report** on match rate, unmatched amounts and anomalies.
+
+It is advisory only: read-only access, suggestions stored separately from links, human
+approval before anything is linked (with its own match type), off without an API key,
+and run on demand or on a schedule rather than per webhook.
 ---
 
 ## What I would improve with more time
@@ -260,13 +287,17 @@ non-reproducible results on financial data.
   appeared in the data.
 - A manual review endpoint to confirm, reject or re-assign matches, plus an audit trail
   of status transitions.
-- LLM-assisted *suggestions* for transactions the rules leave unmatched, for a human to
-  approve — never automatic links.
+- Build the **AI analysis agent** (DESIGN.md §9): explanations and suggested matches for
+  unmatched transactions, pattern detection that proposes new rules, and a reconciliation
+  report — advisory only, with human approval before any link is written.
 - Resolve the open questions in DESIGN.md §7, chiefly whether the 1.5–4.8% short payments
   are fees or partial payments (it decides the right default tolerance).
 
 **API and operations**
-- Rate limiting, cursor-based pagination, and API authentication for the query endpoints.
+- **Rate limiting beyond one process:** buckets live in memory, so multiple instances
+  would each enforce their own limit; move them to Redis or an API gateway. (Single-process
+  rate limiting is built — see DESIGN.md §3.)
+- Cursor-based pagination, and API authentication for the query endpoints.
 - Docker / docker-compose.
 - Structured logs and metrics (match rate, unmatched amount, webhook latency, signature
   failures).
@@ -299,7 +330,8 @@ including how to weigh each trade-off, were mine.
     (fast acknowledgement vs. durability);
   - preferring a missed match over a wrong one, which led to the ambiguity rules, the
     reference grace period, and requiring an exact amount for fuzzy name matches;
-  - keeping AI/LLMs out of the matching path.
+  - using AI for analysis and pattern detection, while keeping the step that links money
+    to invoices deterministic (and designing the advisory analysis agent around that).
 - Challenged assumptions instead of accepting them (for example, that transactions can
   arrive before their payments, which the brief doesn't say). That's why every assumption
   is listed and checked against real data in DESIGN.md §6.
@@ -320,7 +352,7 @@ including how to weigh each trade-off, were mine.
   out-of-order delivery).
 
 **How I validated the AI's output**
-- **Tests:** 411 automated tests, many using real provider events as fixtures, plus
+- **Tests:** 426 automated tests, many using real provider events as fixtures, plus
   replays of seeded simulated data with known correct answers. The matcher must never
   link money to the wrong payment.
 - **Against live data:** checked every stored event and match outcome (24 of 27
@@ -330,7 +362,18 @@ including how to weigh each trade-off, were mine.
   deliberately bad signatures; compared duplicate payloads to confirm only `timestamp`
   differs; benchmarked webhook latency; derived the fuzzy-name threshold from similarity
   scores across all real payers.
-- **Review caught real defects**, each now covered by a test: a crash window that could
-  link a transaction twice, the provided storage losing all data on an interrupted
-  write, a settled payment still showing a balance due, and reference matching that only
-  recognized the one format seen in the sample data.
+- **Independent reviews with fresh context:** I opened new Claude Code sessions that had
+  none of the original conversation and had them review the code cold, so the review
+  wasn't anchored on the reasoning of the session that wrote it. I also ran the
+  code-review skill on the changes. I checked each finding myself before acting on it,
+  and fixed the confirmed ones with a regression test. For example, a fresh-context review
+  found that reference matching only recognized the one format seen in the sample data.
+- **Manual testing in the browser:** I exercised the API through the `/ui` view and the
+  Swagger docs at `/docs`. I checked statuses, linked transactions, unmatched transactions
+  and their reasons, the summary totals, and filtering, search and pagination against the
+  underlying data.
+- **Review caught real defects** (in the writing session and the fresh-context reviews),
+  each now covered by a test: a crash window that could link a transaction twice, the
+  provided storage losing all data on an interrupted write, a settled payment still
+  showing a balance due, and reference matching that only recognized the one format seen
+  in the sample data.
