@@ -453,7 +453,6 @@ Questions we would ask the assignment authors; current handling noted for each.
 - **Rate limiting across instances:** the buckets are in memory (§3 "Rate limiting"), so
   several instances would each allow the full rate; move them to Redis or an API gateway.
 - Cursor-based pagination for large datasets.
-- Docker / docker-compose.
 
 ---
 
