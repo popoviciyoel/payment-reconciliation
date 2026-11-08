@@ -105,7 +105,8 @@ responses. A browser view of the data is at **`/ui`**.
 | `GET` | `/` | Health check |
 
 - **Filters on `GET /payments`:** `status` (`PENDING`, `PARTIALLY_PAID`, `FULLY_PAID`,
-  `OVERPAID`), `search` (payment ID, reference, payer name or email), `page`, and
+  `OVERPAID`), `search` (payment ID, reference, payer name or email; also filters the
+  unmatched transactions), `page`, and
   `page_size` (default 20, max 100).
 - **Rate limiting:** query endpoints share a per-client token bucket (60/min, bursts of 20)
   and return `429` with `Retry-After` when it runs out. Correctly signed webhooks are never
@@ -208,16 +209,11 @@ AI analysis of the raw webhook log classified the real cases that shaped the tie
 step that links money stays deterministic, because it runs on every webhook and must be
 reproducible, auditable and fast.
 
-DESIGN.md §9 describes an **AI analysis agent** (designed, not built). It is read-only and
-advisory. It analyses the **raw events** as the provider sent them, not only the
-reconciliation results, so it can spot new data shapes the rules don't handle yet. It can:
-- **Suggest matches for exceptions**, such as a short payment from a misspelled company
-  name, with a confidence score and its reasoning. A person approves each one.
-- **Investigate breaks**, for example "this $40 gap matches the processor's chargeback fee
-  on the 12th", so analysts don't have to dig for the context.
-- **Propose new rules:** when the agent keeps solving the same kind of exception, that
-  solution becomes a deterministic rule. The AI does discovery, and the rules engine does
-  enforcement.
+DESIGN.md §8 describes a read-only **AI analysis agent** (designed, not built). It reads
+the **raw events** as well as the reconciliation results, and it can **suggest matches** for
+exceptions (for a person to approve), **investigate breaks** ("this $40 gap matches the
+processor's chargeback fee on the 12th"), and **propose new rules**. The AI does
+discovery; the rules engine does enforcement.
 
 ---
 
@@ -232,18 +228,12 @@ reconciliation results, so it can spot new data shapes the rules don't handle ye
   scheduled audit.
 
 **Matching**
-- **Group payments by payer email.** Transactions don't carry an email, so it can't link a
-  transaction directly. But payments with different names and the same email (`Acme Corp`
-  and `ACME Holdings`, both billing@acme.com) could count as one payer in payer + amount
-  matching. In the observed data emails and names are one-to-one (12 each), so this would
-  change nothing yet.
-- **Learn payer accounts from `payer_account_last_four`.** Once confident reference matches
-  show a payer always pays from account `4242`, the account becomes a payer signal that
-  doesn't depend on how the bank spells the name (DESIGN.md Q11). Four digits aren't unique,
-  so it should only strengthen a match, never decide one.
+- **Payer identity beyond the name:** treat payments sharing a `payer_email` as one payer
+  (transactions carry no email, so it can't link them directly), and learn which payer uses
+  which `payer_account_last_four` as a supporting signal only (DESIGN.md §7).
 - A review endpoint to confirm, reject or reassign matches, with an audit trail.
 - Build the AI analysis agent.
-- Find out whether the 1.5–4.8% short payments are fees or partial payments (DESIGN.md §7).
+- Find out whether the 1.5–4.8% short payments are fees or partial payments (DESIGN.md Q2).
   The answer decides the right default tolerance.
 
 **API and operations**
@@ -254,7 +244,8 @@ reconciliation results, so it can spot new data shapes the rules don't handle ye
 **Known limitations**
 - Single process only (locks are in-process).
 - A tolerance change applies on restart and doesn't redo existing links.
-- Refunds and multi-payment transactions are tested but haven't appeared in provider data yet.
+- Multi-payment transactions are tested but haven't appeared in provider data yet. Refunds
+  have (two, both with exact references), but aren't in the committed fixture yet.
 - A refund without a reference can't be matched to a transaction that tier 2c split across
   several payments. It stays unmatched for review.
 - If a noisy reference names one real invoice and one unknown one, the whole transaction
@@ -279,7 +270,8 @@ generate simulated test data. The architecture and design decisions were mine.
   instead of a worker, preferring a missed match over a wrong one, and keeping AI out of the
   step that links money.
 - Questioned assumptions the brief leaves open, such as transactions arriving before their
-  payments. Every assumption is listed and checked against real data in DESIGN.md §6.
+  payments. Every assumption is listed in DESIGN.md §5, marked as confirmed by real data
+  or not yet observed.
 - Registered with the provider, ran the server and ngrok, and investigated problems in the
   live logs.
 
@@ -295,8 +287,10 @@ generate simulated test data. The architecture and design decisions were mine.
 **How I validated it**
 - **Tests:** about 490, many built from real provider events, plus simulated replays with
   known correct answers.
-- **Live data:** checked every stored event and match. 24 of 27 transactions linked as
-  expected, and the three `UNKNOWN-*` transactions were correctly left unmatched.
+- **Live data:** checked every stored event and match. In the committed snapshot
+  (`observed_events.jsonl`), 24 of 27 transactions linked as expected and the three
+  `UNKNOWN-*` transactions were correctly left unmatched. The two refunds that arrived
+  later both linked by exact reference.
 - **Evidence over assumptions:** logged rejected webhooks to confirm the 401s were
   deliberate, compared duplicate payloads, benchmarked latency, and derived the fuzzy
   threshold from real payer names.

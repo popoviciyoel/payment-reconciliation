@@ -2,7 +2,7 @@
 Read-side queries: assemble API views from storage.
 
 Reads use the cached payment projection (status / received_amount) and never
-recompute it (DESIGN.md §5 "Status: recalculate vs store").
+recompute it (DESIGN.md §4 "Data model").
 """
 
 from collections import Counter, defaultdict

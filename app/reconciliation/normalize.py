@@ -1,7 +1,7 @@
 """
 Normalization of references and payer names (pure functions).
 
-Derived from observed provider data (DESIGN.md §4):
+Derived from observed provider data (DESIGN.md §3):
   - real references look like `(REF|ORD|PAY|INV)-YYYY-NNNN`, sometimes wrapped in
     noise (`INV REF-2026-6981`, trailing spaces) or replaced by `UNKNOWN-xxxx`
   - payer names vary by case and legal suffix (`apex trading co`, `Pacific Ventures LLC`)

@@ -1,7 +1,7 @@
 """
 Replays simulated and captured provider data end to end, through signed webhooks.
 
-  - observed_events.jsonl : the real events captured from the mock provider (DESIGN.md §4),
+  - observed_events.jsonl : the real events captured from the mock provider (DESIGN.md §3),
                             including every redelivery
   - edge_cases.jsonl      : hand-written edge cases; each line states its expected outcome
   - generated datasets    : seeded random data with ground truth (scripts/simulate.py),
@@ -124,7 +124,7 @@ def _observed_unique() -> list[dict]:
 
 @pytest.mark.parametrize("with_redeliveries", [False, True])
 def test_observed_provider_data_replay(isolated, with_redeliveries):
-    """Reproduces DESIGN.md §5 'Result on observed data' from the captured events."""
+    """Reproduces DESIGN.md §4 'Result on observed data' from the captured events."""
     store, client = isolated(f"observed_{with_redeliveries}")
     lines = load_jsonl(FIXTURES / "observed_events.jsonl") if with_redeliveries else _observed_unique()
     acks = Counter(ack(deliver(client, l)) for l in lines)
