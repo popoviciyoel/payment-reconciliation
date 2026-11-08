@@ -31,7 +31,7 @@ def test_fixed_allowance_wins_when_larger():
 
 
 def test_observed_short_payments():
-    """DESIGN.md §4: which 'slightly short' payments count as paid at 2%."""
+    """DESIGN.md §3: which 'slightly short' payments count as paid at 2%."""
     assert compute_status(D("2583.76"), D("2544.75"), TOL_2PCT) is S.FULLY_PAID       # -1.5%
     assert compute_status(D("1410.45"), D("1348.80"), TOL_2PCT) is S.PARTIALLY_PAID   # -4.4%
     assert compute_status(D("2874.77"), D("2735.86"), TOL_2PCT) is S.PARTIALLY_PAID   # -4.8%

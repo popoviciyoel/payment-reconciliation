@@ -1,4 +1,4 @@
-"""Matcher tests. Cases marked 'observed' come from real provider data (DESIGN.md §4)."""
+"""Matcher tests. Cases marked 'observed' come from real provider data (DESIGN.md §3)."""
 
 from decimal import Decimal as D
 

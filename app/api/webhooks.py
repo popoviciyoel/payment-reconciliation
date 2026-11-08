@@ -9,6 +9,7 @@ Status codes:
   400  body is not a JSON object
   401  missing / invalid signature
   422  signed payload that fails schema validation
+  429  too many invalid-signature attempts from this client
   500  server misconfigured (no webhook secret)
 """
 

@@ -1,5 +1,5 @@
 """
-Rate limiting: in-memory token buckets keyed by client (DESIGN.md §3 "Rate limiting").
+Rate limiting: in-memory token buckets keyed by client (DESIGN.md §2).
 
   - Query endpoints: RATE_LIMIT_PER_MINUTE sustained, RATE_LIMIT_BURST burst, per client.
   - Webhooks: correctly signed requests are never limited (the signature is the access

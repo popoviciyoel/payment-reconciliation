@@ -2,7 +2,7 @@
 Transaction -> payment matching (pure, no I/O).
 
 Tiers, tried in order; the first that yields an unambiguous answer wins
-(DESIGN.md §5). Currency must always match.
+(DESIGN.md §4). Currency must always match.
 
   1. Reference (any format). Only empty and placeholder references
      (`UNKNOWN-*`, `N/A`, ...) count as "no reference".

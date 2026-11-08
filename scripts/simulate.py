@@ -1,7 +1,7 @@
 """
 Simulated provider data: a seeded generator with ground truth, plus a replayer.
 
-Generated events have the same shape as real provider webhooks (DESIGN.md §4)
+Generated events have the same shape as real provider webhooks (DESIGN.md §3)
 and carry a `truth` field naming the payment(s) each transaction really belongs
 to (`[]` = belongs to nothing and must stay unmatched). Tests use the truth to
 check that the matcher never links money to the wrong payment.
