@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import webhooks
+from app.api import payments, webhooks
 from app.config import settings
 from app.reconciliation.engine import reconcile, refresh_all
 from app.storage import storage
@@ -39,6 +39,7 @@ app = FastAPI(
 )
 
 app.include_router(webhooks.router)
+app.include_router(payments.router)
 
 
 @app.get("/", tags=["health"])
