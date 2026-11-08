@@ -230,6 +230,15 @@ reconciliation results, so it can spot new data shapes the rules don't handle ye
   scheduled audit.
 
 **Matching**
+- **Group payments by payer email.** Transactions don't carry an email, so it can't link a
+  transaction directly. But payments with different names and the same email (`Acme Corp`
+  and `ACME Holdings`, both billing@acme.com) could count as one payer in payer + amount
+  matching. In the observed data emails and names are one-to-one (12 each), so this would
+  change nothing yet.
+- **Learn payer accounts from `payer_account_last_four`.** Once confident reference matches
+  show a payer always pays from account `4242`, the account becomes a payer signal that
+  doesn't depend on how the bank spells the name (DESIGN.md Q11). Four digits aren't unique,
+  so it should only strengthen a match, never decide one.
 - A review endpoint to confirm, reject or reassign matches, with an audit trail.
 - Build the AI analysis agent.
 - Find out whether the 1.5–4.8% short payments are fees or partial payments (DESIGN.md §7).

@@ -83,9 +83,15 @@ request
 - Comparison uses `hmac.compare_digest`.
 - **Fail closed:** if `WEBHOOK_SECRET` is unset, every webhook is rejected (500) rather
   than accepted unverified.
+- **Observed:** the provider occasionally sends an otherwise normal payload with an invalid
+  signature (e.g. `txn_6b40e8cbf37606b8`) and never redelivers it validly — a deliberate
+  forgery test. Rejecting it with `401` is the correct outcome; no change was needed.
 
 ### Idempotency ✅
-- Key = the provider's own ID (`payment_id` / `transaction_id`).
+- Key = the provider's own ID (`payment_id` / `transaction_id`). **Observed:** duplicate
+  deliveries are identical except for `timestamp` (e.g. `pay_a7c17401fb7c6557`), so their
+  bytes and signatures differ — deduplicating on a hash of the body or the signature would
+  have stored each duplicate twice.
 - Check-and-insert runs under a single lock, so concurrent redeliveries can't both insert.
 - A duplicate returns **200** so the provider stops retrying.
 - A duplicate with **different data** keeps the original and logs a warning — silently
@@ -205,16 +211,6 @@ derived from this, not from guesses.
   exact reference). A learned account would never recur, so the signal is not used (Q11).
   Even with stable accounts, four digits collide easily (~39% chance of a shared value
   among 100 payer accounts), so it could only ever *support* a match, never decide one.
-
-### Delivery behaviour
-
-| Observation | Evidence |
-|---|---|
-| Payments arrive as a batch first (20), then transactions; later payment deliveries were all duplicates | Raw log ordering |
-| Duplicates are identical **except `timestamp`** (so raw bytes and signature differ) | `pay_a7c17401fb7c6557`, `pay_53b6eaa7807eb6ee` |
-| Payments were redelivered ~10 minutes after the original | 2 samples (9m54s, 9m51s) |
-| Occasional webhooks carry an invalid signature on an otherwise normal ASCII payload; never redelivered validly | `txn_6b40e8cbf37606b8` — treated as a deliberate forgery test |
-| Real payment payloads omit `description` | All 20 payments |
 
 ---
 
@@ -467,6 +463,14 @@ Questions we would ask the assignment authors; current handling noted for each.
   - keep from-scratch recalculation as a scheduled audit job that reports drift, and
     as an explicit backfill when the fee tolerance changes.
 - Manual review endpoint to confirm/reject low-confidence matches.
+- **Payer identity beyond the name.**
+  - *Email:* only payments carry `payer_email`, so it can't link a transaction. It can
+    group payments: different names with the same email (`Acme Corp` / `ACME Holdings`,
+    both billing@acme.com) would count as one payer in tiers 2 and 2c. Observed emails and
+    names are one-to-one (12 each), so this changes nothing on current data.
+  - *Account:* learn `payer_account_last_four` → payer from confident reference matches,
+    then use it as a payer signal independent of how the bank spells the name (Q11). Four
+    digits collide easily (§4), so it only strengthens a match, never decides one.
 - **Reconciliation analysis agent** (§9): explains unmatched transactions, suggests matches
   for human approval, detects patterns and proposes new rules. Advisory only — never writes links.
 - **Rate limiting across instances:** the buckets are in memory (§3 "Rate limiting"), so
